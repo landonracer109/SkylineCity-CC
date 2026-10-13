@@ -331,7 +331,7 @@ class City:
         placed = sum(k["placed"] for k in kinds.values())
         if not self.samples or now - self.samples[-1][0] >= 60:
             self.samples.append((now, placed))
-            self.samples = [p for p in self.samples if now - p[0] <= 1800]
+            self.samples = [p for p in self.samples if now - p[0] <= 600]
         old = self.samples[0]
         rate = (placed - old[1]) / (now - old[0]) * 3600 if now - old[0] >= 120 else None
         return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": LANES,
