@@ -44,13 +44,18 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .kinds .row span:last-child { color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
 #tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.15); }
 .err { color: var(--bad); }
+.top .spacer { flex: 1; }
+button.pause { font: inherit; font-weight: 600; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 7px; padding: 6px 14px; cursor: pointer; }
+button.pause.on { background: var(--building); color: #1b1305; border-color: var(--building); }
+#banner { display: none; margin-top: 10px; padding: 8px 12px; border-radius: 7px; background: var(--building); color: #1b1305; font-weight: 600; }
 .wrap { overflow-x: auto; }
 </style>
 </head>
 <body>
 <main>
   <section class="panel">
-    <div class="top"><h1>Skyline City</h1><span class="sub" id="when">loading…</span></div>
+    <div class="top"><h1>Skyline City</h1><span class="sub" id="when">loading…</span><span class="spacer"></span><button class="pause" id="pauseBtn" hidden>Pause</button></div>
+    <div id="banner">PAUSED: the turtles stop at a safe spot within a minute and wait. Leave once every turtle shows Paused.</div>
     <div class="bar" style="margin-top:10px"><i id="allbar" style="width:0"></i></div>
     <div class="stats">
       <div class="stat"><b id="sPlaced">–</b><span>blocks placed</span></div>
@@ -69,6 +74,7 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
         <span><i style="background:var(--building)"></i>being built</span>
         <span><i style="background:var(--ready)"></i>ready</span>
         <span><i style="background:var(--waiting)"></i>waiting for others</span>
+        <span><i style="background:var(--bad)"></i>AE short of its blocks</span>
         <span><i style="background:#fff;border-radius:50%"></i>turtle</span>
       </div>
     </section>
@@ -110,12 +116,12 @@ function draw() {
   const [W, D] = S.span, pad = 6, sc = Math.min((c.width - 2 * pad) / W, (c.height - 2 * pad) / D);
   c.height = Math.round(D * sc + 2 * pad);
   g.fillStyle = css("--road"); g.fillRect(0, 0, c.width, c.height);
-  const col = { done: css("--done"), building: css("--building"), ready: css("--ready"), waiting: css("--waiting") };
+  const col = { done: css("--done"), building: css("--building"), ready: css("--ready"), waiting: css("--waiting"), nostock: css("--bad") };
   boxes = [];
   // platform tiles first (under everything), drawn faint; then streets, then buildings
   const order = { ground: 0, street: 1, water: 1, park: 2, tower: 2 };
   const jobs = S.jobs.slice().sort((a, b) => order[a[1]] - order[b[1]]);
-  for (const [id, kind, name, [x0, z0, x1, z1], blocks, h, state, placed, who] of jobs) {
+  for (const [id, kind, name, [x0, z0, x1, z1], blocks, h, state, placed, who, short] of jobs) {
     if (kind === "street" || kind === "water") continue;
     const X = pad + x0 * sc, Y = pad + z0 * sc, w = (x1 - x0 + 1) * sc, d = (z1 - z0 + 1) * sc;
     if (kind === "ground") {
@@ -126,7 +132,7 @@ function draw() {
     if (state === "building" && blocks) {
       g.fillStyle = col.done; const f = placed / blocks; g.fillRect(X + .5, Y + .5 + (d - 1) * (1 - f), w - 1, (d - 1) * f);
     }
-    boxes.push({ X, Y, w, d, id, kind, name, blocks, h, state, placed, who });
+    boxes.push({ X, Y, w, d, id, kind, name, blocks, h, state, placed, who, short });
   }
   // turtles
   for (const [t, r] of Object.entries(S.reports)) {
@@ -147,6 +153,9 @@ function render() {
   document.getElementById("sRate").textContent = S.rate ? fmt(S.rate) : "–";
   document.getElementById("sEta").textContent = S.rate ? hours((total - S.placed) / S.rate) : "–";
   document.getElementById("when").textContent = (100 * S.placed / total).toFixed(1) + "% built · updated " + new Date().toLocaleTimeString();
+  const btn = document.getElementById("pauseBtn");
+  btn.hidden = false; btn.textContent = S.paused ? "Resume" : "Pause"; btn.classList.toggle("on", !!S.paused);
+  document.getElementById("banner").style.display = S.paused ? "block" : "none";
   const byId = Object.fromEntries(S.jobs.map(j => [j[0], j]));
   const rows = Object.entries(S.reports).filter(([t]) => t !== "supply").sort((a, b) => (+a[0].replace(/\D/g, "")) - (+b[0].replace(/\D/g, "")));
   document.getElementById("turtles").innerHTML = rows.map(([t, r]) => {
@@ -169,6 +178,22 @@ function render() {
 }
 function esc(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+// Pause / Resume: the password is the job server's CITY_KEY, asked once and kept in this browser.
+async function togglePause() {
+  let key = null;
+  try { key = localStorage.getItem("cityKey"); } catch (e) {}
+  for (let tries = 0; tries < 2; tries++) {
+    if (!key) { key = prompt("Password for pausing the turtles:"); if (!key) return; }
+    const base = location.pathname.replace(/\/$/, "");
+    const r = await fetch(base + (S && S.paused ? "/resume" : "/pause"), { method: "POST", headers: { "X-Key": key } });
+    if (r.status === 403) { try { localStorage.removeItem("cityKey"); } catch (e) {} key = null; alert("Wrong password."); continue; }
+    try { localStorage.setItem("cityKey", key); } catch (e) {}
+    break;
+  }
+  load();
+}
+document.getElementById("pauseBtn").addEventListener("click", togglePause);
+
 async function load() {
   try {
     const r = await fetch(location.pathname.replace(/\/$/, "") + "/status.json", { cache: "no-store" });
@@ -184,7 +209,8 @@ document.getElementById("map").addEventListener("mousemove", ev => {
   const x = (ev.clientX - r.left) * k, y = (ev.clientY - r.top) * k;
   const b = boxes.slice().reverse().find(b => x >= b.X && x <= b.X + b.w && y >= b.Y && y <= b.Y + b.d);
   if (!b) { tip.style.display = "none"; return; }
-  const st = { done: "built", building: "being built by " + b.who, ready: "ready to start", waiting: "waiting for the platform/streets" }[b.state];
+  const st = { done: "built", building: "being built by " + b.who, ready: "ready to start", waiting: "waiting for the platform/streets",
+    nostock: "AE is short of " + (b.short || []).join(", ") }[b.state];
   tip.innerHTML = `<b>${esc(b.name)}</b><br>${b.h} tall, ${fmt(b.blocks)} blocks<br>${st}${b.state === "building" ? ` (${Math.floor(100 * b.placed / b.blocks)}%)` : ""}`;
   tip.style.display = "block"; tip.style.left = (ev.clientX + 14) + "px"; tip.style.top = (ev.clientY + 14) + "px";
 });

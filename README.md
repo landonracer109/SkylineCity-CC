@@ -9,12 +9,16 @@ server. Built for Minecraft 1.6.4 with OpenPeripherals, EnderStorage and Applied
 - **Job server** ([server/citysrv.py](server/citysrv.py)): splits the city into 206 jobs (72 platform tiles,
   64 street-furniture tiles, 66 buildings and building parts, 3 parks, the park water), hands each
   turtle the next ready job, and plans its flight. Turtles travel on lanes 12–15 blocks above the
-  streets, one height per direction (east, west, south, north), so they never meet head on. Also
-  serves a progress page at `/city/`.
+  streets, one height per direction (east, west, south, north), so they never meet head on. Jobs
+  whose blocks AE is short of are held back (the supply computer sends AE's counts), so no turtle
+  sits waiting while there's other work. Also serves a progress page at `/city/` with a **Pause**
+  button (password: the server's `CITY_KEY`): every turtle stops at a safe spot within a minute and
+  waits for Resume. Pause before leaving the area or restarting the Minecraft server.
 - **`cityfleet`** (turtle): asks for a job, flies there, builds it bottom-up placing blocks down,
   restocks from its own Ender Chest, and asks for the next one. Survives server restarts: it saves
   its state on every move, and tells from its fuel level whether a move whose answer was lost
-  happened.
+  happened. (A turn whose answer is lost can't be told apart, so a restart at exactly that moment
+  could leave a turtle facing the wrong way; pausing first avoids it.)
 - **`citysupply`** (computer at home): keeps every turtle's Ender Chest stocked from AE with exactly
   what its next ~640 placements need, plus coal blocks, and sends everything else back.
 - **`citybuild`**: the older single-building version of the turtle program (no server).

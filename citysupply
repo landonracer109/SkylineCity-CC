@@ -14,7 +14,7 @@
 -- any colours. Private chests work and keep other players out: all 32 must be yours.)
 
 local args = { ... }
-local VERSION = "v1.02"
+local VERSION = "v1.03"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local EVERY = 30            -- seconds between rounds
 local COAL = "173:0"        -- coal blocks, the turtles' fuel
@@ -184,6 +184,29 @@ function needs()   -- (the local declared above buildMap)
   return t
 end
 
+-- AE's count of every block the city uses, for the job server: it holds back jobs whose blocks AE is
+-- short of, so no turtle sits waiting on one while there's other work. Every 5 minutes.
+local materials, lastStock = nil, -1e9
+local function sendStock()
+  if os.clock() - lastStock < 300 then return end
+  lastStock = os.clock()
+  if not materials then
+    local ok, r = pcall(http.get, SERVER .. "/materials")
+    if not ok or not r then return end
+    materials = {}
+    for k in r.readAll():gmatch("(%d+:%d+)") do materials[#materials + 1] = k end
+    r.close()
+  end
+  local _, ae = next(ifaces)
+  local lines = {}
+  for _, k in ipairs(materials) do
+    local id, dmg = k:match("(%d+):(%d+)")
+    local n = tonumber(try(ae, "countOfItemType", tonumber(id), tonumber(dmg)))
+    if n then lines[#lines + 1] = k .. " " .. math.floor(n) end
+  end
+  pcall(function() local r = http.post(SERVER .. "/stock", table.concat(lines, "\n") .. "\n"); if r then r.close() end end)
+end
+
 local function report(msg)
   pcall(function()
     local r = http.post(SERVER .. "/report?t=supply", "phase supply\nversion " .. VERSION .. "\nmsg " .. msg .. "\n")
@@ -228,7 +251,11 @@ local function stock(label, chest, m, want)
     end
   end
   local missing = {}
-  for key, w in pairs(want) do
+  -- coal first: with many kinds of block the chest can fill up, and a turtle without fuel is stuck
+  local order = { COAL }
+  for key in pairs(want) do if key ~= COAL then order[#order + 1] = key end end
+  for _, key in ipairs(order) do
+    local w = want[key]
     local need = w - (have[key] or 0)
     if need >= MIN_SEND or (need > 0 and (have[key] or 0) == 0) then
       local id, dmg = key:match("^(%d+):(%d+)$")
@@ -302,6 +329,7 @@ while true do
         if r ~= "ok" then notes[#notes + 1] = label .. ": " .. r end
       end
     end
+    sendStock()
     local note = #notes > 0 and table.concat(notes, "; ") or "all chests stocked"
     if note ~= lastNote then say(note); lastNote = note end
     report(note)

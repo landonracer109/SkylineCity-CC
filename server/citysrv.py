@@ -10,6 +10,11 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
                                                ("t chest <frequency>" and "t id:dmg n" lines)
   GET  /city/                              -> progress page (city.html, next to this file)
   GET  /city/status.json                    -> everything the page shows, as JSON
+  GET  /city/materials                      -> every block the city uses ("id:dmg" lines)
+  POST /city/stock                          body: "id:dmg n" lines, AE's counts (from citysupply);
+                                               jobs needing blocks AE is short of are held back
+  POST /city/pause, /city/resume  (X-Key)   -> every turtle stops at a safe point / carries on
+                                               (reports are answered "pause" while paused)
   POST /city/reset  (X-Key)                 -> forget all progress (for tests)
 Coordinates on the wire are world coordinates. Inside, columns are city-local (origin = NW corner).
 """
@@ -104,13 +109,17 @@ class City:
         self.homes = s.get("homes", {})          # label -> [x, y, z] world
         self.reports = s.get("reports", {})      # label -> last report (dict)
         self.doneAt = s.get("doneAt", {})        # job -> unix time
+        self.paused = s.get("paused", False)     # Pause button: every turtle stops at a safe point
+        self.stock = s.get("stock", {})          # "id:dmg" -> how many AE has (from the supply computer)
+        self.stockAt = s.get("stockAt", 0)
 
     def save(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = self.path() + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"done": sorted(self.done), "claims": self.claims, "homes": self.homes,
-                       "reports": self.reports, "doneAt": self.doneAt}, f)
+                       "reports": self.reports, "doneAt": self.doneAt, "paused": self.paused,
+                       "stock": self.stock, "stockAt": self.stockAt}, f)
         os.replace(tmp, self.path())
 
     # ---- routing ----
@@ -172,16 +181,42 @@ class City:
         j = self.jobs[jid]
         return all(a in self.done for a in j.get("after", []))
 
+    def reserved(self):
+        """Blocks still to come out of AE for the jobs being built now (their unbuilt share)."""
+        out = {}
+        for label, c in self.claims.items():
+            jid = c["job"]
+            if jid in self.done:
+                continue
+            j, r = self.jobs[jid], self.reports.get(label, {})
+            left = 1.0
+            if r.get("job") == jid and j["blocks"]:
+                left = max(0.0, 1 - (int(r.get("cell", 1)) - 1) / j["blocks"])
+            for k, n in j["need"].items():
+                out[k] = out.get(k, 0) + n * left
+        return out
+
+    def missing(self, jid, reserved=None):
+        """Blocks this job needs that AE doesn't have enough of, after what the jobs under way still
+        need (going by the supply computer's last count, if it is under an hour old; with no count,
+        nothing counts as missing)."""
+        if not self.stock or time.time() - self.stockAt > 3600:
+            return []
+        if reserved is None:
+            reserved = self.reserved()
+        return [k for k, n in self.jobs[jid]["need"].items() if k in self.stock and self.stock[k] - reserved.get(k, 0) < n]
+
     def pick(self, label, sx, sz, dist):
         """The job to give this turtle: platform tiles first (everything waits on them), then street
         tiles (towers wait on them), then the biggest ready building, so the last hours aren't one
-        turtle finishing a giant alone. Nearest breaks ties. Water needs a bucket turtle, so
-        cityfleet never gets it."""
+        turtle finishing a giant alone. Nearest breaks ties. Jobs needing blocks AE is short of wait.
+        Water needs a bucket turtle, so cityfleet never gets it."""
         held = {c["job"] for c in self.claims.values()}
+        res = self.reserved()
         best, bestKey = None, None
         for jid in self.order:
             j = self.jobs[jid]
-            if jid in self.done or jid in held or j["kind"] == "water" or not self.ready(jid):
+            if jid in self.done or jid in held or j["kind"] == "water" or not self.ready(jid) or self.missing(jid, res):
                 continue
             ds = [dist[d] for d, _ in self.docks(j) if d in dist]
             if not ds:
@@ -200,6 +235,8 @@ class City:
         return " ".join("%d,%d" % self.world(x, z) for x, z in corners)
 
     def next(self, label, wx, wy, wz):
+        if self.paused:
+            return "wait 20 paused"
         sx, sz = self.local(wx, wz)
         dist, par = self.bfs(sx, sz)
         c = self.claims.get(label)
@@ -214,6 +251,11 @@ class City:
                 left = [k for k in self.order if k not in self.done and self.jobs[k]["kind"] != "water"]
                 if left:
                     busy = sum(1 for k in left if k in {c["job"] for c in self.claims.values()})
+                    res = self.reserved()
+                    short = sorted({k for jid in left if jid not in {c["job"] for c in self.claims.values()} for k in self.missing(jid, res)})
+                    if short:
+                        return "wait 60 %d jobs left, %d being built; the rest wait for blocks AE is short of: %s" % (
+                            len(left), busy, ", ".join(self.names.get(k, k) for k in short))
                     return "wait 30 %d jobs left, %d being built, the rest wait for them" % (len(left), busy)
                 home = self.homes.get(label)
                 if not home:
@@ -271,6 +313,7 @@ class City:
         reports = {k: dict(r, age=int(now - r.get("at", now))) for k, r in self.reports.items()}
         # each job: id, kind, name, box (city-local x0 z0 x1 z1), blocks, height, state, placed
         building = {c["job"]: label for label, c in self.claims.items() if c["job"] not in self.done}
+        res = self.reserved()
         jobs = []
         for jid in self.order:
             j = self.jobs[jid]
@@ -279,9 +322,12 @@ class City:
             elif jid in building:
                 r = self.reports.get(building[jid], {})
                 state, placed = "building", max(0, int(r.get("cell", 1)) - 1) if r.get("job") == jid else 0
+            elif self.missing(jid, res):
+                state, placed = "nostock", 0
             else:
                 state, placed = ("ready" if self.ready(jid) else "waiting"), 0
-            jobs.append([jid, j["kind"], j["name"], list(self.box(j)), j["blocks"], j["size"][1], state, placed, building.get(jid)])
+            jobs.append([jid, j["kind"], j["name"], list(self.box(j)), j["blocks"], j["size"][1], state, placed, building.get(jid),
+                         [self.names.get(k, k) for k in self.missing(jid, res)] if state == "nostock" else []])
         placed = sum(k["placed"] for k in kinds.values())
         if not self.samples or now - self.samples[-1][0] >= 60:
             self.samples.append((now, placed))
@@ -290,7 +336,8 @@ class City:
         rate = (placed - old[1]) / (now - old[0]) * 3600 if now - old[0] >= 120 else None
         return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": LANES,
                 "doneCount": len(self.done), "jobCount": len(self.order), "jobs": jobs, "names": self.names,
-                "origin": self.O, "span": [self.spanX, self.spanZ], "placed": placed, "rate": rate}
+                "origin": self.O, "span": [self.spanX, self.spanZ], "placed": placed, "rate": rate,
+                "paused": self.paused, "stockAge": int(now - self.stockAt) if self.stockAt else None}
 
 
 city = City()
@@ -342,6 +389,9 @@ class H(BaseHTTPRequestHandler):
                             k, _, n = item.partition("=")
                             lines.append("%s %s %s" % (label, k, n))
                     return self.reply(200, "\n".join(lines) + "\n")
+                if path == "/city/materials":
+                    # every block the city uses ("id:dmg" per line), for the supply computer's counts
+                    return self.reply(200, "\n".join(sorted(k for k in city.names if k != "326:0")) + "\n")
                 if path == "/city/status.json":
                     return self.reply(200, json.dumps(city.status()), "application/json")
                 if path == "/city":
@@ -366,11 +416,27 @@ class H(BaseHTTPRequestHandler):
                 r["at"] = time.time()
                 city.reports[q.get("t", "?")] = r
                 city.save()
+                return self.reply(200, "pause\n" if city.paused else "ok\n")   # turtles stop while paused
+            if path == "/city/stock":
+                # the supply computer's AE counts: "id:dmg n" per line
+                for line in body.splitlines():
+                    k, _, n = line.partition(" ")
+                    if k and n.strip().isdigit():
+                        city.stock[k] = int(n)
+                city.stockAt = time.time()
+                city.save()
                 return self.reply(200, "ok\n")
+            if path in ("/city/pause", "/city/resume"):
+                if not KEY or self.headers.get("X-Key") != KEY:
+                    return self.reply(403, "wrong password\n")
+                city.paused = path == "/city/pause"
+                city.save()
+                return self.reply(200, ("paused" if city.paused else "running") + "\n")
             if path == "/city/reset":
                 if not KEY or self.headers.get("X-Key") != KEY:
                     return self.reply(403, "no\n")
                 city.done, city.claims, city.reports, city.doneAt = set(), {}, {}, {}
+                city.paused, city.stock, city.stockAt = False, {}, 0
                 for jid in (body.split() if body.strip() else []):     # optional: jobs to mark done
                     city.done.add(jid)
                 city.save()

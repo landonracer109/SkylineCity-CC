@@ -11,9 +11,22 @@ local JOBS, N, RESTARTS, SEED, HOURS = arg[1], tonumber(arg[2] or 4), tonumber(a
 local SERVER = os.getenv("SERVER") or "http://127.0.0.1:8097/city"
 local KEY = os.getenv("CITY_KEY") or ""
 local ONLY = os.getenv("ONLY")      -- e.g. "g" = only jobs whose id starts with g count for "finished"
+-- PAUSE="from,to" (sim seconds): press Pause, then Resume. No turtle may move or place from 2 min
+-- after Pause until Resume.
+-- STOCKOUT="928:6,2522:0" STOCKBACK=<hours>: AE has none of those blocks until then; the sim sends
+-- the stock counts every 5 min like citysupply. No turtle should sit waiting for them.
+local PAUSE = os.getenv("PAUSE")
+local STOCKOUT, STOCKBACK = {}, tonumber(os.getenv("STOCKBACK") or 0) * 3600
+for k in (os.getenv("STOCKOUT") or ""):gmatch("[^,]+") do STOCKOUT[k] = true end
 math.randomseed(SEED)
 local DIR = os.getenv("SIMDIR") or "simfleet"
-os.execute('rm -rf "' .. DIR .. '"; mkdir -p "' .. DIR .. '"')
+-- Windows (cmd) or Linux (sh). On Windows a fresh SIMDIR is needed per run (nothing is deleted).
+local WIN = package.config:sub(1, 1) == "\\"
+local function mkdir(p)
+  if WIN then os.execute('mkdir "' .. p:gsub("/", "\\") .. '" 2>nul') else os.execute('mkdir -p "' .. p .. '"') end
+end
+if not WIN then os.execute('rm -rf "' .. DIR .. '"') end
+mkdir(DIR)
 
 -- ---------- http through curl ----------
 local function curl(args)
@@ -46,7 +59,7 @@ local function readPlan(file)
 end
 local expected = {}
 do
-  local p = io.popen('ls "' .. JOBS .. '"')
+  local p = io.popen(WIN and ('dir /b "' .. JOBS:gsub("/", "\\") .. '"') or ('ls "' .. JOBS .. '"'))
   for f in p:lines() do
     if f:match("%.txt$") and f ~= "water.txt" and (not ONLY or f:sub(1, #ONLY) == ONLY) then expected[#expected + 1] = readPlan(JOBS .. "/" .. f) end
   end
@@ -80,7 +93,7 @@ local function makeTurtle(n)
   local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * (n - 1), y = GROUND, z = DEPOT_Z, f = 3, fuel = 2500, sel = 1, inv = {},
     clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
   T.inv[16] = { id = ENDER, dmg = n, qty = 1 }
-  os.execute('mkdir -p "' .. T.dir .. '"')
+  mkdir(T.dir)
   turtleAt[key(T.x, T.y, T.z)] = T
   turtles[n] = T
   return T
@@ -111,9 +124,12 @@ local function aeFill(T)
   end
   local inv = T.chest
   local want = { [COALB .. ":0"] = 64 }
-  for _, m in ipairs(T.planMats) do want[m[1] .. ":" .. m[2]] = 128 end
+  for _, m in ipairs(T.planMats) do local k = m[1] .. ":" .. m[2]; if not (STOCKOUT[k] and clock < STOCKBACK) then want[k] = 128 end end
   for s = 1, 27 do local st = inv[s]; if st and not want[st.id .. ":" .. st.dmg] then inv[s] = nil end end
-  for k, n in pairs(want) do
+  local keys = { COALB .. ":0" }   -- coal first, like citysupply: a full chest must not starve fuel
+  for k in pairs(want) do if k ~= COALB .. ":0" then keys[#keys + 1] = k end end
+  for _, k in ipairs(keys) do
+    local n = want[k]
     local id, dmg = k:match("(%d+):(%d+)"); id, dmg = tonumber(id), tonumber(dmg)
     local have = 0
     for s = 1, 27 do local st = inv[s]; if st and st.id == id and st.dmg == dmg then have = have + st.qty end end
@@ -138,6 +154,12 @@ local function envFor(T)
       if qty <= 0 then return end
     end
   end
+  local function trace(msg)
+    T.trace = T.trace or {}
+    T.trace[#T.trace + 1] = string.format("%8.1f %s  real %d,%d,%d f%d fuel %d", T.clock, msg, T.x, T.y, T.z, T.f, T.fuel)
+    if #T.trace > 40 then table.remove(T.trace, 1) end
+  end
+  T.traceFn = trace
   local function move(dir)
     local kill = restartDue(T)
     if kill and math.random() < .5 then coroutine.yield("KILL") end
@@ -151,6 +173,7 @@ local function envFor(T)
     if T.fuel <= 0 then return false end
     turtleAt[key(T.x, T.y, T.z)] = nil
     T.fuel = T.fuel - 1; T.x, T.y, T.z = x, y, z; stats.moves = stats.moves + 1
+    trace("moved " .. dir .. (kill and " (answer lost)" or "")); T.acts = (T.acts or 0) + 1
     turtleAt[key(x, y, z)] = T
     if kill then stats.lostMoves = stats.lostMoves + 1; coroutine.yield("KILL") end   -- moved, but the answer is lost
     return true
@@ -174,7 +197,7 @@ local function envFor(T)
     if at(x, y, z) or turtleAt[key(x, y, z)] then return false end
     world[key(x, y, z)] = { id = st.id, dmg = st.dmg }
     st.qty = st.qty - 1; if st.qty == 0 then T.inv[T.sel] = nil end
-    if st.id ~= ENDER then stats.places = stats.places + 1 end
+    if st.id ~= ENDER then stats.places = stats.places + 1; T.acts = (T.acts or 0) + 1 end
     return true
   end
   local function compare(dir)
@@ -186,8 +209,8 @@ local function envFor(T)
   end
   E.turtle = {
     forward = function() return move("forward") end, up = function() return move("up") end, down = function() return move("down") end,
-    turnLeft = function() simple(.4); T.f = (T.f + 3) % 4; stats.turns = stats.turns + 1; return true end,
-    turnRight = function() simple(.4); T.f = (T.f + 1) % 4; stats.turns = stats.turns + 1; return true end,
+    turnLeft = function() simple(.4); T.f = (T.f + 3) % 4; stats.turns = stats.turns + 1; trace("turned left"); return true end,
+    turnRight = function() simple(.4); T.f = (T.f + 1) % 4; stats.turns = stats.turns + 1; trace("turned right"); return true end,
     detect = function() return detect("forward") end, detectUp = function() return detect("up") end, detectDown = function() return detect("down") end,
     dig = function() return dig("forward") end, digUp = function() return dig("up") end, digDown = function() return dig("down") end,
     place = function() return place("forward") end, placeUp = function() return place("up") end, placeDown = function() return place("down") end,
@@ -274,7 +297,21 @@ local function envFor(T)
       if mode == "a" then return { writeLine = function(s) local h = io.open(path(p), "ab"); h:write(s, "\n"); h:close() end, close = function() end } end
       if mode == "w" then
         local buf = {}
-        return { write = function(s) buf[#buf + 1] = s end, close = function() local h = io.open(path(p), "wb"); h:write(table.concat(buf)); h:close() end }
+        return { write = function(s) buf[#buf + 1] = s end, close = function()
+          local text = table.concat(buf)
+          local h = io.open(path(p), "wb"); h:write(text); h:close()
+          if p == "fleet.state" and not T.desynced then
+            local st = textutils.unserialize(text)
+            local q = st and st.pos
+            if q and (q.x ~= T.x or q.y ~= T.y or q.z ~= T.z or q.f ~= T.f) then
+              T.desynced = true
+              io.stderr:write(string.format("DESYNC t%d at %.0f s: saved %d,%d,%d f%d, real %d,%d,%d f%d, phase %s, pend %s\n", T.n, T.clock,
+                q.x, q.y, q.z, q.f, T.x, T.y, T.z, T.f, tostring(st.phase), st.pend and "yes" or "no"))
+              for _, l in ipairs(T.trace or {}) do io.stderr:write("   " .. l .. "\n") end
+              for i = math.max(1, #T.log - 10), #T.log do io.stderr:write("   log " .. T.log[i] .. "\n") end
+            end
+          end
+        end }
       end
       local h = io.open(path(p), "rb"); if not h then return nil end
       return { readLine = function() return h:read("*l") end, readAll = function() return h:read("*a") end, close = function() h:close() end }
@@ -286,7 +323,11 @@ local function envFor(T)
     post = function(url, body)
       simple(.1)
       local f = io.open(T.dir .. "/.post", "wb"); f:write(body); f:close()
-      return resp(curl('--data-binary @"' .. T.dir .. '/.post" "' .. url .. '"'))
+      local s = curl('--data-binary @"' .. T.dir .. '/.post" "' .. url .. '"')
+      if os.getenv("DEBUGHTTP") and url:find("/report") then
+        io.stderr:write(string.format("%7.0f t%d %s -> %s\n", T.clock, T.n, body:match("msg ([^\n]*)") or "", ((s or "nil"):gsub("\n", ""))))
+      end
+      return resp(s)
     end,
   }
   E.sleep = function(n) if restartDue(T) then coroutine.yield("KILL") end; act(T, n) end
@@ -298,6 +339,14 @@ local function envFor(T)
     s = tostring(s)
     T.log[#T.log + 1] = string.format("%8.0fs  %s", T.clock, s)
     if s:find("Nothing left to build") then T.finished = true end
+    if s:find("Paused") then T.saidPaused = true end
+    local bx, by, bz = s:match("in my way at (%-?%d+),(%-?%d+),(%-?%d+)")
+    if bx and not T.toldBlock then
+      T.toldBlock = true
+      local b = world[key(tonumber(bx), tonumber(by), tonumber(bz))]
+      io.stderr:write(string.format("t%d (fuel %d, at %d,%d,%d facing %d, clock %d) blocked at %s,%s,%s by %s (turtle there: %s)\n", T.n, T.fuel, T.x, T.y, T.z, T.f, T.clock, bx, by, bz,
+        b and (b.id .. ":" .. b.dmg) or "nothing", tostring(turtleAt[key(tonumber(bx), tonumber(by), tonumber(bz))] and turtleAt[key(tonumber(bx), tonumber(by), tonumber(bz))].n)))
+    end
   end
   E.shell = { run = function() end }
   return E
@@ -324,6 +373,14 @@ for n = 1, N do start(makeTurtle(n), { tostring(n), SERVER, "go" }) end
 
 -- ---------- run ----------
 local lastAE, lastShow, deadline = -1e9, 0, HOURS * 3600
+local pFrom, pTo = (PAUSE or ""):match("(%d+),(%d+)")
+pFrom, pTo = tonumber(pFrom), tonumber(pTo)
+local pState, movesAt, pausedMoves, pauseDetail = 0, 0, nil, ""
+local lastStock, materials = -1e9, nil
+local function postBody(path, body, key)
+  local f = io.open(DIR .. "/body2", "wb"); f:write(body); f:close()
+  return curl(string.format('-X POST %s --data-binary @%s/body2 "%s%s"', key and ('-H "X-Key: ' .. KEY .. '"') or "", DIR, SERVER, path))
+end
 local stuckSince = {}
 local ended = "time limit"
 while true do
@@ -332,10 +389,31 @@ while true do
   if not T then ended = "every turtle stopped"; break end
   clock = T.clock
   if clock - lastAE >= 5 then lastAE = clock; for _, t in ipairs(turtles) do aeFill(t) end end
+  -- Pause / Resume
+  if pFrom then
+    if pState == 0 and clock >= pFrom then pState = 1; assert(postBody("/pause", "", true):match("paused"), "pause refused") end
+    if pState == 1 and clock >= pFrom + 120 then pState = 2; movesAt = stats.moves + stats.places; for _, t in ipairs(turtles) do t.actsAt = t.acts or 0 end end
+    if pState == 2 and clock >= pTo then
+      pState = 3; pausedMoves = stats.moves + stats.places - movesAt
+      local parts = {}
+      for _, t in ipairs(turtles) do parts[#parts + 1] = string.format("t%d:%d%s", t.n, (t.acts or 0) - (t.actsAt or 0), t.saidPaused and "P" or "") end
+      pauseDetail = table.concat(parts, " ") assert(postBody("/resume", "", true):match("running"), "resume refused") end
+  end
+  -- stock counts, like citysupply
+  if next(STOCKOUT) and clock - lastStock >= 300 then
+    lastStock = clock
+    materials = materials or curl('"' .. SERVER .. '/materials"')
+    local lines = {}
+    for k in materials:gmatch("(%d+:%d+)") do lines[#lines + 1] = k .. " " .. ((STOCKOUT[k] and clock < STOCKBACK) and 0 or 1000000) end
+    postBody("/stock", table.concat(lines, "\n") .. "\n")
+  end
   if clock > deadline then break end
   local done = true
   for _, t in ipairs(turtles) do if not t.finished then done = false end end
   if done then ended = "all turtles home, nothing left"; break end
+  -- stalled: nothing placed for 2 sim-hours while work is left
+  if stats.places ~= (lastPlaces or -1) then lastPlaces, lastPlaceAt = stats.places, clock end
+  if clock - (lastPlaceAt or 0) > 7200 then ended = "STALLED (nothing placed for 2 h)"; break end
   if clock - lastShow > 1800 then
     lastShow = clock
     io.stderr:write(string.format("%5.1f h  placed %d  waits for turtles %d  http %d\n", clock / 3600, stats.places, stats.waitsTurtle, stats.http))
@@ -348,6 +426,7 @@ while true do
   elseif sig == "KILL" then
     stats.restarts = stats.restarts + 1
     T.log[#T.log + 1] = string.format("%8.0fs  -- server restart --", T.clock)
+    if T.traceFn then T.traceFn("RESTART") end
     T.clock = T.clock + 30
     start(T, {})
   elseif coroutine.status(T.co) == "dead" then
@@ -377,6 +456,12 @@ end
 local mb = {}
 for id, n in pairs(missingBy) do mb[#mb + 1] = id .. ":" .. n end
 table.sort(mb)
+if pFrom then io.write(string.format("\npause %d..%d s: moves + placements while paused (from 2 min after Pause): %s\n  per turtle (P = said Paused): %s\n", pFrom, pTo, tostring(pausedMoves), pauseDetail)) end
+if next(STOCKOUT) then
+  local stuck = 0
+  for _, T in ipairs(turtles) do for _, l in ipairs(T.log) do if l:find("needs") then stuck = stuck + 1 end end end
+  io.write(string.format("Ender Chest waits logged (\"needs ...\"): %d\n", stuck))
+end
 io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
 if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",

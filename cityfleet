@@ -17,7 +17,7 @@
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.03"
+local VERSION = "v1.06"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -74,10 +74,12 @@ local function get(path)
   return s
 end
 
+-- Returns the server's answer (nil when it can't be reached).
 local function post(path, body)
   local ok, r = pcall(http.post, cfg.server .. path, body)
-  if ok and r then r.close() end
-  return ok and r ~= nil
+  if not ok or not r then return nil end
+  local s = r.readAll(); r.close()
+  return s or ""
 end
 
 local function lines(s)
@@ -204,23 +206,45 @@ local function upcoming()
   return need, order
 end
 
+-- Returns the server's answer: "pause" while the Pause button is on (nil if no report was due).
+local pausing, pauseHere = false, nil   -- (pauseHere is below)
+
+-- Sends where I am and what I need next. Any answer of "pause" (the Pause button) stops me right
+-- here until Resume, whatever sent the report, so every report checks it (a report at the start of
+-- each new floor used to reset the once-a-minute one and skip the check).
 local function report(force, msg)
   if msg then lastMsg = msg end
-  if not force and os.clock() - lastReport < REPORT_EVERY then return end
+  if not force and os.clock() - lastReport < REPORT_EVERY then return nil end
   lastReport = os.clock()
   local need = {}
   if st.phase == "build" or st.phase == "go" then
     local n = upcoming()
     for m, k in pairs(n) do need[#need + 1] = plan.mats[m].id .. ":" .. plan.mats[m].dmg .. "=" .. k end
   end
-  post("/report?t=" .. cfg.label, table.concat({
+  local reply = post("/report?t=" .. cfg.label, table.concat({
     "phase " .. st.phase, "job " .. (st.job and st.job.id or "-"), "cell " .. (st.cell or 0),
     "total " .. (plan and #plan.xs or 0), "x " .. pos.x, "y " .. pos.y, "z " .. pos.z,
     "fuel " .. tostring(turtle.getFuelLevel()), "version " .. VERSION, "chest " .. (st.chest and (st.chest.id .. ":" .. st.chest.dmg) or "-"), "msg " .. lastMsg,
     "need " .. table.concat(need, " ") }, "\n"))
+  local answer = reply and reply:match("^(%a+)")
+  if answer == "pause" and not pausing then pauseHere(); answer = "ok" end
+  return answer
 end
 
 local function tell(msg) say(msg); report(true, msg) end
+
+-- The Pause button: stay right here (state saved) until the server says carry on. Reports are only
+-- sent between moves and placements, so nothing is half done. A server that can't be reached doesn't
+-- pause anyone.
+pauseHere = function()
+  pausing = true
+  save()
+  say("Paused. Waiting for Resume...")
+  report(true, "Paused")
+  repeat sleep(15) until report(true, "Paused") ~= "pause"
+  pausing = false
+  tell("Resumed.")
+end
 
 ---------------------------------------------------------------------------------------------------
 -- the Ender Chest
@@ -265,6 +289,7 @@ end
 local FUEL = { ["173:0"] = true, ["263:0"] = true, ["263:1"] = true }   -- coal block, coal, charcoal
 
 local function refuelFrom(chest, upTo)
+  save()   -- (see restock)
   local limit = turtle.getFuelLimit and turtle.getFuelLimit() or 20000
   upTo = math.min(upTo or limit - 1000, limit - 1000)
   local notFuel = {}
@@ -301,6 +326,9 @@ end
 -- while the block the next placement needs (`want`) or fuel is missing from the chest.
 local function restock(want, fuelWanted)
   fuelWanted = fuelWanted or MIN_FUEL
+  -- Save first: the position after my last move may not be saved yet, and refuelling here would
+  -- break the fuel check that recovers a move lost in a restart (fuel one less = I moved).
+  save()
   say(string.format("Restocking at block %d (fuel %s)", st.cell or 0, tostring(turtle.getFuelLevel())))
   local chest = placeChest()
   while true do
@@ -406,6 +434,7 @@ local function step(dir)
   end
   pos.x, pos.y, pos.z = nx, ny, nz
   st.pend = nil
+  report(false)     -- a report is due every minute; its answer may be "pause"
 end
 
 local function moveX(x) if pos.x ~= x then turnTo(x > pos.x and 0 or 2) end; while pos.x ~= x do step("forward") end end
@@ -661,6 +690,7 @@ if st.phase == "build" or st.phase == "go" or st.phase == "leave" then plan = lo
 rescan()
 if not fs.exists("startup") then writeFile("startup", 'shell.run("cityfleet")\n') end
 
+report(true)     -- check in before moving at all: a Pause pressed while I was off applies first
 local ok, err = pcall(loop)
 if not ok then
   if err == "Terminated" then say("Stopped (Ctrl+T). Run cityfleet to carry on."); return end

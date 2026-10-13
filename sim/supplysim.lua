@@ -5,7 +5,7 @@
 -- yet: a spare one should take its colours), city3 (colours 300, idle: its chest should be emptied
 -- back to AE except coal). AE is short of lapis. Checks the chests after two rounds.
 local DIR = "simsupply"
-for _, f in ipairs({ "supply.log", "citysupply.map", "citysupply.cfg", "startup" }) do os.remove(DIR .. "/" .. f) end
+for _, f in ipairs({ "supply.log", "citysupply.map", "citysupply.map2", "citysupply.cfg", "startup" }) do os.remove(DIR .. "/" .. f) end
 
 local AE = { ["173:0"] = 1000, ["1:0"] = 5000, ["4095:0"] = 3000, ["22:0"] = 40, ["928:2"] = 900 }
 local calls = 0
@@ -87,9 +87,13 @@ peripheral = {
   wrap = function(n) return P[n] end,
 }
 local NEEDS = "city1 chest 100\ncity1 4095:0 380\ncity1 928:2 200\ncity1 22:0 60\ncity2 chest 200\ncity2 1:0 640\ncity3 chest 300\n"
+local POSTED = {}
 http = {
-  get = function(url) assert(url:match("/needs$")); return { readAll = function() return NEEDS end, close = function() end } end,
-  post = function() return { close = function() end } end,
+  get = function(url)
+    if url:match("/materials$") then return { readAll = function() return "1:0\n22:0\n928:2\n928:6\n" end, close = function() end } end
+    assert(url:match("/needs$")); return { readAll = function() return NEEDS end, close = function() end }
+  end,
+  post = function(url, body) POSTED[url:match("/(%w+)$")] = body; return { close = function() end } end,
 }
 local function path(p) return DIR .. "/" .. p end
 fs = {
@@ -126,4 +130,5 @@ local function show(name)
 end
 print("chests after 2 rounds:")
 for _, n in ipairs({ "ender_chest_0", "ender_chest_1", "ender_chest_2", "ender_chest_3", "ender_chest_4" }) do show(n) end
+print("stock sent: " .. ((POSTED.stock or "nothing"):gsub("\n", ", ")))
 print(string.format("AE now: lapis %d, stone %d, coal blocks %d, dirt %d; peripheral calls %d", AE["22:0"], AE["1:0"], AE["173:0"], AE["3:0"] or 0, calls))

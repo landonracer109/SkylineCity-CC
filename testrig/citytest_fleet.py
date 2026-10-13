@@ -12,7 +12,7 @@ IDS, NT = IDS.split(","), int(NT)
 J = json.load(open(os.path.join(JOBS, "jobs.json")))
 OX, OY, OZ = J["origin"]
 DEPOT_X0, DEPOT_Z, STEP = OX + 4, OZ - 2, 8     # must match citysrv's DEPOT_* settings
-FREQ = 292
+FREQ = int(os.environ.get("FREQ", "292"))   # Ender Chest frequency shared by the test turtles and the feeder
 blocks, tes = {}, {}
 
 need = {}
