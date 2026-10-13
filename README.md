@@ -22,7 +22,8 @@ server. Built for Minecraft 1.6.4 with OpenPeripherals, EnderStorage and Applied
 ## Install (in game, with the `get` program)
 
 Turtles: advanced turtle with a Narcissistic upgrade (OpenPeripherals Addons) and a diamond
-pickaxe, a public Ender Chest in slot 16 (different colours for each turtle).
+pickaxe, an Ender Chest in slot 16 (different colours for each turtle; private chests work and keep
+other players out, but then every chest, turtle or home, must be yours).
 
 ```
 get https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/<commit>/cityfleet cityfleet
@@ -33,7 +34,8 @@ Put turtle `<slot>` (1–16) on its depot spot facing **north** first: x = −85
 y 63, z −200. It counts its own moves (there's no GPS), so never move it by hand while it runs.
 
 Supply computer: wired modems on 4 ME Interfaces (ME cable on the bottom) and on 16 public Ender
-Chests around them (any colours: a spare chest takes the colours of a turtle that has none).
+Chests around them (any colours: a spare chest takes the colours of a turtle that has none;
+private or public, the same as the turtles' chests).
 
 ```
 get https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/<commit>/citysupply citysupply

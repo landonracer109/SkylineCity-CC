@@ -11,7 +11,7 @@
 -- Pairing chests with turtles is by Ender Chest colours: each turtle reports the colours of the
 -- chest it carries, and the home chest with the same colours is its. A turtle with no matching home
 -- chest gets a spare one: I set that chest's colours to the turtle's. (So: one home chest per turtle,
--- any colours, all public chests.)
+-- any colours. Private chests work and keep other players out: all 32 must be yours.)
 
 local args = { ... }
 local VERSION = "v1.00"
