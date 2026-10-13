@@ -74,6 +74,19 @@ local predone = {}
 for id in (os.getenv("PREDONE") or ""):gmatch("%S+") do predone[id] = true end
 for _, p in ipairs(expected) do if predone[p.id] then for _, c in ipairs(p.cells) do local m = p.mats[c[4]]; world[key(c[1], c[2], c[3])] = { id = m.id, dmg = m.dmg } end end end
 local function at(x, y, z) return world[key(x, y, z)] end
+-- PLANTS=n: n plants (like HarvestCraft seaweed) floating at building-ground level across the city
+-- area and the depot strip. Turtles have to clear the ones in their way; none may be left.
+local PLANTS = tonumber(os.getenv("PLANTS") or 0)
+if PLANTS > 0 then
+  local f = io.open(JOBS .. "/jobs.json", "rb"); local jt = f:read("*a"); f:close()
+  local ox, oy, oz = jt:match('"origin"%s*:%s*%[%s*(%-?%d+),%s*(%-?%d+),%s*(%-?%d+)')
+  ox, oy, oz = tonumber(ox), tonumber(oy), tonumber(oz)
+  PLANT_ORIGIN = { ox, oy, oz }
+  for _ = 1, PLANTS do
+    local x, z = ox + math.random(-2, 262), oz + math.random(-2, 270)
+    if not world[key(x, oy, z)] and z ~= oz + 266 then world[key(x, oy, z)] = { id = 31, dmg = 0, plant = true } end
+  end
+end
 
 local clock = 0            -- the scheduler's time (the earliest turtle's)
 local restartTimes = {}
@@ -447,7 +460,16 @@ for _, p in ipairs(expected) do
     elseif b.id ~= m.id or b.dmg ~= m.dmg then wrong = wrong + 1; if wrong <= 5 then io.write("  wrong at ", k, " have ", b.id, ":", b.dmg, " want ", m.id, ":", m.dmg, " (", p.id, ")\n") end end
   end
 end
-for k, b in pairs(world) do if not want[k] then extra = extra + 1; if extra <= 5 then io.write("  extra block ", k, " id ", b.id, ":", b.dmg, "\n") end end end
+local plantsLeft = 0
+for k, b in pairs(world) do
+  if b.plant then
+    -- a plant inside the city area that no turtle cleared
+    local x, _, z = k:match("(%-?%d+),(%-?%d+),(%-?%d+)")
+    local lx, lz = tonumber(x) - PLANT_ORIGIN[1], tonumber(z) - PLANT_ORIGIN[3]
+    if lx >= 0 and lx <= 260 and lz >= 0 and lz <= 253 then plantsLeft = plantsLeft + 1; if plantsLeft <= 5 then io.write("  plant left at ", k, "\n") end end
+  elseif not want[k] then extra = extra + 1; if extra <= 5 then io.write("  extra block ", k, " id ", b.id, ":", b.dmg, "\n") end end
+end
+if PLANTS > 0 then io.write(string.format("plants left in the city area: %d\n", plantsLeft)) end
 for _, T in ipairs(turtles) do
   io.write(string.format("\n== turtle %d at %d,%d,%d facing %d, fuel %d, clock %.1f h ==\n", T.n, T.x, T.y, T.z, T.f, T.fuel, T.clock / 3600))
   local from = tonumber(os.getenv("LOGLINES") or 12)

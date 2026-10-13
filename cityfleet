@@ -17,7 +17,7 @@
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.06"
+local VERSION = "v1.07"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -419,7 +419,10 @@ local function step(dir)
       if peripheral.getType(SIDE[dir]) == "turtle" then
         if not told then say("Another turtle is in my way; waiting for it."); told = true end
         sleep(1 + math.random())
-      elseif dir == "down" or not mayDig then
+      elseif not mayDig or (dir == "down" and st.phase == "build") then
+        -- On the lanes nothing should be there, and while building, going down only ever happens
+        -- onto my own next layer: ask instead of digging. Coming down a dock column into a job
+        -- (empty in the plan) a plant or other junk is dug out like anything else.
         tell(string.format("Something is in my way at %d,%d,%d; please clear it.", nx, ny, nz))
         sleep(10)
       elseif dir == "up" and turtle.getItemCount(CHEST) == 0 and peripheral.wrap("top") and peripheral.wrap("top").getAllStacks then
