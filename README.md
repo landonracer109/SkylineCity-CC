@@ -33,7 +33,7 @@ cityfleet <slot>
 Put turtle `<slot>` (1–16) on its depot spot facing **north** first: x = −858 + 8 × (slot − 1),
 y 63, z −200. It counts its own moves (there's no GPS), so never move it by hand while it runs.
 
-Supply computer: wired modems on 4 ME Interfaces (ME cable on the bottom) and on 16 public Ender
+Supply computer: wired modems on 4 ME Interfaces (ME cable on the bottom) and on 16 Ender
 Chests around them (any colours: a spare chest takes the colours of a turtle that has none;
 private or public, the same as the turtles' chests).
 
