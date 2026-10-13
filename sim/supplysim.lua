@@ -9,18 +9,27 @@ for _, f in ipairs({ "supply.log", "citysupply.map", "citysupply.cfg", "startup"
 
 local AE = { ["173:0"] = 1000, ["1:0"] = 5000, ["4095:0"] = 3000, ["22:0"] = 40, ["928:2"] = 900 }
 local calls = 0
+local INV = {}       -- frequency -> inventory (chests on the same colours share it)
+local function invOf(f) INV[f] = INV[f] or {}; return INV[f] end
 local function newChest(freq)
-  local c = { freq = freq, inv = {} }
-  return c
+  return setmetatable({ freq = freq }, { __index = function(t, k) if k == "inv" then return invOf(t.freq) end end })
 end
-local CH = {
+local SHARED = os.getenv("SHARED")
+local CH = SHARED and {
+  ender_chest_0 = newChest(0), ender_chest_1 = newChest(0), ender_chest_2 = newChest(0),
+  ender_chest_3 = newChest(0), ender_chest_4 = newChest(0),
+} or {
   ender_chest_0 = newChest(100), ender_chest_1 = newChest(555), ender_chest_2 = newChest(300),
   ender_chest_3 = newChest(777), ender_chest_4 = newChest(888),
 }
+-- the suction chest on frequency 0 empties it into AE now and then
+local function suck() for s2 = 1, 27 do local st = invOf(0)[s2]; if st then AE[st.id .. ":" .. st.dmg] = (AE[st.id .. ":" .. st.dmg] or 0) + st.qty; invOf(0)[s2] = nil end end end
 -- leftovers in city3's chest (it's between jobs) and junk in city1's
+if not SHARED then
 CH.ender_chest_2.inv[1] = { id = 1, dmg = 0, qty = 50 }
 CH.ender_chest_2.inv[2] = { id = 173, dmg = 0, qty = 10 }
 CH.ender_chest_0.inv[5] = { id = 3, dmg = 0, qty = 12 }
+end
 -- which chest is on which side of which interface
 local SIDES = { me_interface_0 = { north = "ender_chest_0", south = "ender_chest_1" }, me_interface_1 = { east = "ender_chest_2", up = "ender_chest_3" } }
 local OPP = { north = "south", south = "north", east = "west", west = "east", up = "down", down = "up" }
@@ -51,7 +60,7 @@ end
 local function chestP(name)
   local c = CH[name]
   return {
-    getAllStacks = function() calls = calls + 1; local t = {}; for s = 1, 27 do t[s] = c.inv[s] and { id = c.inv[s].id, dmg = c.inv[s].dmg, qty = c.inv[s].qty } end; return t end,
+    getAllStacks = function() calls = calls + 1; if math.random() < .5 then suck() end; local t = {}; for s = 1, 27 do t[s] = c.inv[s] and { id = c.inv[s].id, dmg = c.inv[s].dmg, qty = c.inv[s].qty } end; return t end,
     getFrequency = function() calls = calls + 1; return c.freq end,
     setFrequency = function(f) calls = calls + 1; c.freq = f end,
     pushItem = function(dir, slot, n)

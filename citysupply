@@ -14,13 +14,18 @@
 -- any colours. Private chests work and keep other players out: all 32 must be yours.)
 
 local args = { ... }
-local VERSION = "v1.01"
+local VERSION = "v1.02"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local EVERY = 30            -- seconds between rounds
 local COAL = "173:0"        -- coal blocks, the turtles' fuel
 local COAL_KEEP = 64
 local MIN_SEND = 16         -- don't bother topping up less than this (unless the chest has none)
-local MAP_FILE, CFG_FILE = "citysupply.map", "citysupply.cfg"
+local MAP_FILE, CFG_FILE = "citysupply.map2", "citysupply.cfg"   -- (.map from v1.00/1.01 may be wrong: not used)
+-- While working out the layout every home chest needs colours of its own (chests on the same colours
+-- share one inventory, so a test item shows up in all of them). Chests that share colours get these
+-- for now: black, black and a third colour per chest (frequency 0xFF0 + n). A turtle's colours
+-- replace them when it first reports. Change TEMP_FREQ in citysupply.cfg if you use those colours.
+local TEMP_FREQ = 0xFF0
 local DIRS = { "north", "south", "east", "west", "up", "down" }
 local OPP = { north = "south", south = "north", east = "west", west = "east", up = "down", down = "up" }
 
@@ -45,6 +50,7 @@ end
 local cfg = textutils.unserialize(readFile(CFG_FILE) or "") or {}
 if args[1] and args[1] ~= "map" then cfg.server = args[1]:gsub("/$", ""); writeFile(CFG_FILE, textutils.serialize(cfg)) end
 local SERVER = cfg.server or DEFAULT_SERVER
+TEMP_FREQ = cfg.tempFreq or TEMP_FREQ
 
 ---------------------------------------------------------------------------------------------------
 -- peripherals
@@ -90,6 +96,7 @@ local function countIn(p, id, dmg)
   return n
 end
 
+local needs     -- (the job server call, defined below)
 local function buildMap()
   -- the probe: a common block AE has (counted the way stockkeep does, which works on big networks;
   -- the full item list can come back empty there)
@@ -103,6 +110,32 @@ local function buildMap()
   end
   if not probe then say("Can't work out the chests: AE has none of " .. table.concat(seen, ", ") .. ". Put some coal blocks in AE."); return end
   say("Working out which chest touches which interface...")
+  -- first, colours of its own for every chest that isn't already a turtle's (default colours are
+  -- usually some other chest's too, like a suction chest into AE)
+  local count, n = {}, 0
+  local t = needs and needs() or {}
+  for _, e in pairs(t) do if e.freq then count[e.freq] = 1 end end
+  for name, c in pairs(chests) do
+    local f = tonumber(try(c, "getFrequency"))
+    if f and count[f] == 1 then count[f] = 0 end    -- this one is a turtle's home chest already
+  end
+  local names = {}
+  for name in pairs(chests) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local c = chests[name]
+    local f = tonumber(try(c, "getFrequency"))
+    if not f or count[f] ~= 0 then
+      local nf = TEMP_FREQ + n
+      n = n + 1
+      try(c, "setFrequency", nf)
+      if tonumber(try(c, "getFrequency")) ~= nf then
+        say("Can't change the colours of " .. name .. ". Give the home chests different colours by hand, then run citysupply map.")
+        return
+      end
+    end
+  end
+  if n > 0 then say(n .. " home chests got colours of their own for now (black, black, a third colour).") end
   local unmapped = {}
   for name in pairs(chests) do if not map[name] then unmapped[name] = true end end
   for iname, ae in pairs(ifaces) do
@@ -136,7 +169,7 @@ end
 ---------------------------------------------------------------------------------------------------
 -- the job server
 
-local function needs()
+function needs()   -- (the local declared above buildMap)
   local ok, r = pcall(http.get, SERVER .. "/needs")
   if not ok or not r then return nil end
   local t = {}
