@@ -1,0 +1,82 @@
+-- feeder: stands in for AE on the test server. Keeps the Ender Chest next to this computer stocked
+-- from the supply chests beside it (a set number of every building block, and fuel), and moves
+-- anything else the turtles hand back into the first supply chest. supply.cfg lists what is in
+-- each supply chest slot:
+--   { side = <Ender Chest -> chest for hand-backs>, free = { empty slots of that chest },
+--     list = { { slot, id, dmg, keep, side }, ... } }
+-- (side in each entry: the direction from the Ender Chest to the chest that slot is in)
+local h = fs.open("supply.cfg", "r")
+local cfg = textutils.unserialize(h.readAll())
+h.close()
+
+local E
+for _, name in ipairs(peripheral.getNames()) do
+  local p = peripheral.wrap(name)
+  if p.getAllStacks and p.pullItem then E = p end
+end
+assert(E, "no Ender Chest next to me")
+
+local function stacks(p)
+  local ok, all = pcall(p.getAllStacks)
+  if not ok or type(all) ~= "table" then return {} end
+  if all[0] == nil then return all end
+  local s = {}
+  for k, v in pairs(all) do s[k + 1] = v end
+  return s
+end
+
+local wanted = {}
+for _, s in ipairs(cfg.list) do wanted[s[2] .. ":" .. s[3]] = s[4] end
+local empty = {}           -- supply slots known to be empty
+-- hand-backs go into the free slots, one kind of block per slot, and are handed out again from there
+local back = {}            -- free slot -> { entry in cfg.list, qty }
+local function handBack(slot, st)
+  local key = st.id .. ":" .. st.dmg
+  for _, r in ipairs(cfg.free or {}) do
+    local b = back[r]
+    if not b or (b.key == key and b.qty < 64) then
+      local moved = E.pushItem(cfg.side, slot, b and 64 - b.qty or 64, r) or 0
+      if moved > 0 then
+        if not b then
+          b = { key = key, qty = 0, i = #cfg.list + 1 }
+          back[r] = b
+          cfg.list[b.i] = { r, st.id, st.dmg, wanted[key] or 0, cfg.side }
+        end
+        b.qty = b.qty + moved
+        empty[b.i] = nil
+        return moved
+      end
+    end
+  end
+  return 0
+end
+local log = fs.open("feeder.log", "a")
+
+while true do
+  local inE = {}
+  for slot, st in pairs(stacks(E)) do
+    if type(st) == "table" and st.id then
+      local key = st.id .. ":" .. st.dmg
+      if wanted[key] and (inE[key] or 0) < wanted[key] * 2 then
+        inE[key] = (inE[key] or 0) + st.qty
+      else
+        local moved = handBack(slot, st)
+        log.writeLine(os.clock() .. " returned " .. moved .. " of " .. key)
+      end
+    end
+  end
+  for i, s in ipairs(cfg.list) do
+    local key = s[2] .. ":" .. s[3]
+    local short = s[4] - (inE[key] or 0)
+    if short > 0 and not empty[i] then
+      local ok, moved = pcall(E.pullItem, s[5], s[1], math.min(64, short))
+      if not ok then log.writeLine(os.clock() .. " pullItem error: " .. tostring(moved)); moved = 0 end
+      moved = moved or 0
+      if moved == 0 then empty[i] = true end
+      for _, b in pairs(back) do if b.i == i then b.qty = b.qty - moved; if b.qty <= 0 then b.qty = 0 end end end
+      inE[key] = (inE[key] or 0) + moved
+    end
+  end
+  log.flush()
+  sleep(2)
+end

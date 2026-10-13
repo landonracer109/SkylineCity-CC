@@ -1,0 +1,673 @@
+-- cityfleet: one of the Skyline City turtles. Asks the city job server for a job, flies there along
+-- the lanes, builds it, and asks for the next one, until the city is done; then flies home.
+-- ComputerCraft 1.63 turtle with a Narcissistic upgrade (OpenPeripherals Addons, reads the turtle's
+-- own inventory) and a diamond pickaxe. Its own Ender Chest in slot 16 (each turtle has its own
+-- frequency; the supply computer at home keeps it stocked with what this turtle reports it needs).
+--
+-- Usage
+--   cityfleet <slot> [server]   first start: put me on my depot spot (slot 1-16) facing NORTH
+--   cityfleet <slot> [server] go   the same, without waiting for Enter
+--   cityfleet                   carries on after a restart (runs from startup by itself)
+--   cityfleet status            what I'm doing
+--
+-- I keep track of where I am by counting my own moves (there's no GPS), so I must start exactly on
+-- my depot spot facing north, and must never be moved by hand while the program runs. If that
+-- happens: pick me up, put me back on my depot spot facing north, and run "cityfleet <slot> go".
+-- Travelling, I fly at one height per direction (east, west, south, north each have their own lane
+-- above the streets) so turtles never meet head on.
+
+local args = { ... }
+local VERSION = "v1.03"
+local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
+local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
+local CHEST = 16
+local MIN_FUEL = 300
+local TRAVEL_FUEL = 2000    -- topped up to this before flying to a new job
+local WINDOW = 640          -- each restock loads blocks for this many upcoming placements
+local REPORT_EVERY = 60     -- seconds between progress reports (and on every new layer)
+
+local function say(msg)
+  print(msg)
+  local line = string.format("[day %d %s] %s", os.day(), textutils.formatTime(os.time(), true), msg)
+  if fs.exists("city.log") and fs.getSize("city.log") > 16000 then
+    local h = fs.open("city.log", "r"); local keep = h.readAll():sub(-8000); h.close()
+    h = fs.open("city.log", "w"); h.write(keep); h.close()
+  end
+  local h = fs.open("city.log", "a")
+  if h then h.writeLine(line); h.close() end
+end
+
+local function readFile(name)
+  local h = fs.open(name, "r")
+  if not h then return nil end
+  local s = h.readAll(); h.close()
+  return s
+end
+
+local function writeFile(name, s)
+  local h = fs.open(name, "w"); h.write(s); h.close()
+end
+
+---------------------------------------------------------------------------------------------------
+-- state: st = { phase, pos = { x, y, z, f }, home = { x, y, z }, job = { id, kind, name, at, dock,
+-- enter }, lanes = { e, w, s, n, wait }, legs, leg, cell, chest, pend }. Everything in world coords.
+
+local cfg, st, pos
+
+local function save() writeFile(STATE_FILE, textutils.serialize(st)) end
+
+local function loadState()
+  local s = readFile(STATE_FILE)
+  s = s and textutils.unserialize(s)
+  if type(s) ~= "table" or not s.pos or not s.phase then return false end
+  st, pos = s, s.pos
+  return true
+end
+
+---------------------------------------------------------------------------------------------------
+-- the job server
+
+local function get(path)
+  local ok, r = pcall(http.get, cfg.server .. path)
+  if not ok or not r then return nil end
+  local s = r.readAll(); r.close()
+  return s
+end
+
+local function post(path, body)
+  local ok, r = pcall(http.post, cfg.server .. path, body)
+  if ok and r then r.close() end
+  return ok and r ~= nil
+end
+
+local function lines(s)
+  local t = {}
+  for l in (s or ""):gmatch("[^\n]+") do t[#t + 1] = l end
+  return t
+end
+
+---------------------------------------------------------------------------------------------------
+-- the build file (cells converted to world coordinates)
+
+local plan
+
+local function loadPlan()
+  local h = fs.open(PLAN_FILE, "r")
+  if not h then return nil, "no build file" end
+  local p = { mats = {}, xs = {}, ys = {}, zs = {}, ms = {} }
+  local y, at = 0, nil
+  while true do
+    local line = h.readLine()
+    if not line then break end
+    local a, b, c = line:match("^(%-?%d+) (%-?%d+) (%d+)$")
+    if a then
+      local n = #p.xs + 1
+      p.xs[n], p.ys[n], p.zs[n], p.ms[n] = tonumber(a) + at.x, y + at.y, tonumber(b) + at.z, tonumber(c)
+    else
+      local cmd, rest = line:match("^(%S+)%s*(.*)$")
+      if cmd == "L" then y = tonumber(rest)
+      elseif cmd == "at" then
+        local ax, ay, az = rest:match("^(%-?%d+) (%-?%d+) (%-?%d+)")
+        at = { x = tonumber(ax), y = tonumber(ay), z = tonumber(az) }
+      elseif cmd == "mat" then
+        local n, id, dmg, name = rest:match("^(%d+) (%d+) (%d+) (.*)$")
+        p.mats[tonumber(n)] = { id = tonumber(id), dmg = tonumber(dmg), name = name }
+      elseif cmd == "name" then p.name = rest
+      elseif cmd == "end" then p.complete = true end
+    end
+  end
+  h.close()
+  if not p.complete or not at then return nil, "the build file is cut short" end
+  return p
+end
+
+---------------------------------------------------------------------------------------------------
+-- inventory: the Narcissistic upgrade tells us what is in each slot
+
+local self_
+local slotMat = {}
+local dirty = true
+
+local function findSelf()
+  for _, side in ipairs({ "left", "right" }) do
+    local methods = peripheral.getMethods(side)
+    if methods then
+      for _, m in ipairs(methods) do
+        if m == "getAllStacks" then return peripheral.wrap(side) end
+      end
+    end
+  end
+  return nil
+end
+
+local function stacksOf(p)
+  local ok, all = pcall(p.getAllStacks)
+  if not ok or type(all) ~= "table" then return {} end
+  if all[0] == nil then return all end
+  local shifted = {}
+  for k, v in pairs(all) do shifted[k + 1] = v end
+  return shifted
+end
+
+local function matOf(stack)
+  if type(stack) ~= "table" or not stack.id or not plan then return nil end
+  for n, m in pairs(plan.mats) do
+    if m.id == stack.id and m.dmg == stack.dmg then return n end
+  end
+  return nil
+end
+
+local function isChest(stack)
+  return type(stack) == "table" and st and st.chest and stack.id == st.chest.id and stack.dmg == st.chest.dmg
+end
+
+local function rescan()
+  local stacks = stacksOf(self_)
+  slotMat = {}
+  for s = 1, 15 do
+    if isChest(stacks[s]) and turtle.getItemCount(CHEST) == 0 then
+      turtle.select(s); turtle.transferTo(CHEST)
+    else
+      slotMat[s] = matOf(stacks[s])
+    end
+  end
+  dirty = false
+end
+
+local function slotFor(m)
+  if dirty then rescan() end
+  for s = 1, 15 do
+    if slotMat[s] == m and turtle.getItemCount(s) > 0 then return s end
+  end
+  return nil
+end
+
+local function fuelLevel()
+  local f = turtle.getFuelLevel()
+  if f == "unlimited" then return math.huge end
+  return f
+end
+
+---------------------------------------------------------------------------------------------------
+-- reporting: where I am, how far the job is, and what my Ender Chest should hold next
+
+local lastReport, lastMsg = -1e9, ""
+
+local function upcoming()
+  local need, order = {}, {}
+  if not plan or not st.cell then return need, order end
+  for i = st.cell, math.min(#plan.xs, st.cell + WINDOW - 1) do
+    local m = plan.ms[i]
+    if not need[m] then need[m] = 0; order[#order + 1] = m end
+    need[m] = need[m] + 1
+  end
+  return need, order
+end
+
+local function report(force, msg)
+  if msg then lastMsg = msg end
+  if not force and os.clock() - lastReport < REPORT_EVERY then return end
+  lastReport = os.clock()
+  local need = {}
+  if st.phase == "build" or st.phase == "go" then
+    local n = upcoming()
+    for m, k in pairs(n) do need[#need + 1] = plan.mats[m].id .. ":" .. plan.mats[m].dmg .. "=" .. k end
+  end
+  post("/report?t=" .. cfg.label, table.concat({
+    "phase " .. st.phase, "job " .. (st.job and st.job.id or "-"), "cell " .. (st.cell or 0),
+    "total " .. (plan and #plan.xs or 0), "x " .. pos.x, "y " .. pos.y, "z " .. pos.z,
+    "fuel " .. tostring(turtle.getFuelLevel()), "version " .. VERSION, "chest " .. (st.chest and (st.chest.id .. ":" .. st.chest.dmg) or "-"), "msg " .. lastMsg,
+    "need " .. table.concat(need, " ") }, "\n"))
+end
+
+local function tell(msg) say(msg); report(true, msg) end
+
+---------------------------------------------------------------------------------------------------
+-- the Ender Chest
+
+local function placeChest()
+  if turtle.getItemCount(CHEST) == 0 and turtle.detectUp() then
+    local p = peripheral.wrap("top")
+    if p and p.getAllStacks then return p end
+  end
+  turtle.select(CHEST)
+  while not turtle.placeUp() do
+    if turtle.detectUp() and peripheral.getType("top") ~= "turtle" then
+      turtle.digUp(); dirty = true
+    else
+      tell(turtle.getItemCount(CHEST) == 0 and "Put my Ender Chest back in slot 16." or "Waiting for room above me for the Ender Chest...")
+      sleep(5)
+    end
+    turtle.select(CHEST)
+  end
+  for _ = 1, 20 do
+    local p = peripheral.wrap("top")
+    if p and p.getAllStacks then return p end
+    sleep(0.1)
+  end
+  error("The Ender Chest above me can't be read. Is OpenPeripherals installed?")
+end
+
+local function pickUpChest()
+  turtle.select(CHEST)
+  turtle.digUp()
+  turtle.select(1)
+  dirty = true
+end
+
+local function freeSlot()
+  for s = 1, 15 do if turtle.getItemCount(s) == 0 then return s end end
+  return nil
+end
+
+-- Only these are burned: anything else in the chest (oak logs for a park, planks...) is somebody's
+-- building block, even when it isn't one of mine.
+local FUEL = { ["173:0"] = true, ["263:0"] = true, ["263:1"] = true }   -- coal block, coal, charcoal
+
+local function refuelFrom(chest, upTo)
+  local limit = turtle.getFuelLimit and turtle.getFuelLimit() or 20000
+  upTo = math.min(upTo or limit - 1000, limit - 1000)
+  local notFuel = {}
+  for _ = 1, 30 do
+    if fuelLevel() >= upTo then return end
+    local slot = freeSlot()
+    if not slot then return end
+    local found = false
+    for cs, stack in pairs(stacksOf(chest)) do
+      local key = type(stack) == "table" and stack.id and (stack.id .. ":" .. stack.dmg)
+      if key and FUEL[key] and not notFuel[key] then
+        found = true
+        chest.pushItem("down", cs, 64, slot)
+        turtle.select(slot)
+        if turtle.refuel(0) then
+          local before = fuelLevel()
+          turtle.refuel(1)
+          local each = math.max(1, fuelLevel() - before)
+          while turtle.getItemCount(slot) > 0 and fuelLevel() < upTo and fuelLevel() + each <= limit do
+            if not turtle.refuel(1) then break end
+          end
+        else
+          notFuel[key] = true
+        end
+        if turtle.getItemCount(slot) > 0 then turtle.dropUp() end
+        break
+      end
+    end
+    if not found then return end
+  end
+end
+
+-- Swaps the inventory over to what the next WINDOW placements need (nothing, between jobs), waiting
+-- while the block the next placement needs (`want`) or fuel is missing from the chest.
+local function restock(want, fuelWanted)
+  fuelWanted = fuelWanted or MIN_FUEL
+  say(string.format("Restocking at block %d (fuel %s)", st.cell or 0, tostring(turtle.getFuelLevel())))
+  local chest = placeChest()
+  while true do
+    local need, order = upcoming()
+    local slots, used = {}, 0
+    for _, m in ipairs(order) do
+      local k = math.min(math.ceil(need[m] / 64), 15 - used)
+      if k <= 0 then break end
+      slots[m], used = k, used + k
+    end
+    rescan()
+    local keep = {}
+    for s = 1, 15 do
+      local m, n = slotMat[s], turtle.getItemCount(s)
+      if n > 0 then
+        if m and slots[m] and (keep[m] or 0) < slots[m] then
+          keep[m] = (keep[m] or 0) + 1
+        else
+          turtle.select(s)
+          turtle.dropUp()
+          if turtle.getItemCount(s) > 0 then say("My Ender Chest is full; can't hand back slot " .. s .. ".") end
+        end
+      end
+    end
+    rescan()
+    local stacks = stacksOf(chest)
+    for _, m in ipairs(order) do
+      if slots[m] then
+        local target = math.min(need[m], slots[m] * 64)
+        local have = 0
+        for s = 1, 15 do if slotMat[s] == m then have = have + turtle.getItemCount(s) end end
+        for cs, stack in pairs(stacks) do
+          if have >= target then break end
+          if matOf(stack) == m and (stack.qty or 0) > 0 then
+            for s = 1, 15 do
+              if have >= target or (stack.qty or 0) <= 0 then break end
+              local cnt = turtle.getItemCount(s)
+              if (slotMat[s] == m and cnt < 64) or cnt == 0 then
+                local moved = chest.pushItem("down", cs, math.min(64 - cnt, target - have, stack.qty), s) or 0
+                if moved > 0 then slotMat[s] = m end
+                have, stack.qty = have + moved, stack.qty - moved
+              end
+            end
+          end
+        end
+      end
+    end
+    if fuelLevel() < math.max(MIN_FUEL * 10, fuelWanted) then refuelFrom(chest, math.max(MIN_FUEL * 10, fuelWanted)) end
+    rescan()
+    if (not want or slotFor(want)) and fuelLevel() >= fuelWanted then break end
+    tell("My Ender Chest needs " .. (want and not slotFor(want) and plan.mats[want].name or "fuel (coal)") .. ". Waiting...")
+    report(true)
+    sleep(10)
+  end
+  pickUpChest()
+end
+
+---------------------------------------------------------------------------------------------------
+-- moving (x east, z south; facing 0 = east, 1 = south, 2 = west, 3 = north)
+
+local DX = { [0] = 1, 0, -1, 0 }
+local DZ = { [0] = 0, 1, 0, -1 }
+local SIDE = { forward = "front", up = "top", down = "bottom" }
+local mayDig = true      -- false on the lanes: nothing should be there, so ask instead of digging
+
+local function turnTo(f)
+  while pos.f ~= f do
+    if (pos.f + 1) % 4 == f then turtle.turnRight(); pos.f = f
+    else turtle.turnLeft(); pos.f = (pos.f + 3) % 4 end
+    save()
+  end
+end
+
+local function step(dir)
+  if fuelLevel() < MIN_FUEL then restock(nil) end
+  local move, detect, dig, attack = turtle.forward, turtle.detect, turtle.dig, turtle.attack
+  if dir == "up" then move, detect, dig, attack = turtle.up, turtle.detectUp, turtle.digUp, turtle.attackUp
+  elseif dir == "down" then move, detect, dig, attack = turtle.down, turtle.detectDown, turtle.digDown, turtle.attackDown end
+  local nx, ny, nz = pos.x, pos.y, pos.z
+  if dir == "up" then ny = ny + 1 elseif dir == "down" then ny = ny - 1 else nx, nz = nx + DX[pos.f], nz + DZ[pos.f] end
+  -- If the server stops right after a move, the move happened but I never heard back. The fuel
+  -- level tells: one less than before means I moved (see the start of the program).
+  st.pend = { fuel = turtle.getFuelLevel(), x = nx, y = ny, z = nz }
+  save()
+  local told, since = false, os.clock()
+  while not move() do
+    if detect() then
+      if peripheral.getType(SIDE[dir]) == "turtle" then
+        if not told then say("Another turtle is in my way; waiting for it."); told = true end
+        sleep(1 + math.random())
+      elseif dir == "down" or not mayDig then
+        tell(string.format("Something is in my way at %d,%d,%d; please clear it.", nx, ny, nz))
+        sleep(10)
+      elseif dir == "up" and turtle.getItemCount(CHEST) == 0 and peripheral.wrap("top") and peripheral.wrap("top").getAllStacks then
+        pickUpChest()
+      else
+        dig(); dirty = true
+      end
+    elseif not attack() then
+      sleep(0.5)
+    end
+    st.pend.fuel = turtle.getFuelLevel()   -- a restock while waiting changes the fuel
+  end
+  pos.x, pos.y, pos.z = nx, ny, nz
+  st.pend = nil
+end
+
+local function moveX(x) if pos.x ~= x then turnTo(x > pos.x and 0 or 2) end; while pos.x ~= x do step("forward") end end
+local function moveZ(z) if pos.z ~= z then turnTo(z > pos.z and 1 or 3) end; while pos.z ~= z do step("forward") end end
+local function moveY(y) while pos.y < y do step("up") end; while pos.y > y do step("down") end end
+
+local function goTo(x, y, z)
+  if pos.y < y then moveY(y) end
+  moveX(x); moveZ(z)
+  if pos.y > y then moveY(y) end
+end
+
+-- Legs: a list of moves saved with the state, so a restart carries on with the one it was on.
+--   { "v", y }        straight up or down
+--   { "h", x, z }     along x, then along z, at the height I'm at
+-- `lane = true` on a leg means it is flown on the lanes (no digging).
+local function runLegs()
+  while st.leg <= #st.legs do
+    local l = st.legs[st.leg]
+    mayDig = not l.lane
+    if l[1] == "v" then moveY(l[2]) else moveX(l[2]); moveZ(l[3]) end
+    mayDig = true
+    st.leg = st.leg + 1
+    save()
+  end
+end
+
+-- Legs along the server's route (corner columns, world x,z), each run at its direction's lane.
+local function laneLegs(route, legs)
+  local x, z = pos.x, pos.z
+  for _, c in ipairs(route) do
+    local h
+    if c.x > x then h = st.lanes.e elseif c.x < x then h = st.lanes.w
+    elseif c.z > z then h = st.lanes.s else h = st.lanes.n end
+    legs[#legs + 1] = { "v", h, lane = true }
+    legs[#legs + 1] = { "h", c.x, c.z, lane = true }
+    x, z = c.x, c.z
+  end
+  return legs
+end
+
+local function parseRoute(rest)
+  local route = {}
+  for x, z in rest:gmatch("(%-?%d+),(%-?%d+)") do route[#route + 1] = { x = tonumber(x), z = tonumber(z) } end
+  return route
+end
+
+local function parseLanes(rest)
+  local e, w, s, n, wt = rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+)")
+  return { e = tonumber(e), w = tonumber(w), s = tonumber(s), n = tonumber(n), wait = tonumber(wt) }
+end
+
+---------------------------------------------------------------------------------------------------
+-- placing
+
+local function placeCell(i)
+  local x, y, z, m = plan.xs[i], plan.ys[i], plan.zs[i], plan.ms[i]
+  goTo(x, y + 1, z)
+  for _ = 1, 200 do
+    local s = slotFor(m)
+    if not s then
+      restock(m)
+    else
+      turtle.select(s)
+      if turtle.detectDown() then
+        if turtle.compareDown() then return end
+        turtle.digDown(); dirty = true
+      elseif turtle.placeDown() then
+        return
+      else
+        turtle.attackDown(); sleep(0.5)
+      end
+    end
+  end
+  error(string.format("Couldn't place %s at %d,%d,%d.", plan.mats[m].name, x, y, z))
+end
+
+---------------------------------------------------------------------------------------------------
+-- the phases: ask -> go -> build -> leave -> ask ... -> home -> ask (waits for more work)
+
+local function ask()
+  -- out of the lanes before standing still
+  if pos.y >= st.lanes.e and pos.y < st.lanes.wait then moveY(st.lanes.wait); save() end
+  local reply = get(string.format("/next?t=%s&x=%d&y=%d&z=%d", cfg.label, pos.x, pos.y, pos.z))
+  if not reply then say("Can't reach the job server; trying again in 30 s."); sleep(30); return end
+  local L = lines(reply)
+  local head = L[1] or ""
+  if head:match("^wait") then
+    local secs, why = head:match("^wait (%d+) ?(.*)")
+    if why ~= lastMsg then tell("Waiting: " .. (why or "")) end
+    sleep(tonumber(secs) or 30)
+    return
+  end
+  if head == "none" then
+    if lastMsg ~= "Nothing left to build. I'm home." then tell("Nothing left to build. I'm home.") end
+    sleep(300)
+    return
+  end
+  local info = {}
+  for i = 2, #L do
+    local k, rest = L[i]:match("^(%S+)%s*(.*)$")
+    if k then info[k] = rest end
+  end
+  if not info["end"] and not L[#L]:match("^end") then say("Half an answer from the job server; asking again."); sleep(10); return end
+  st.lanes = parseLanes(info.lanes or "")
+  local route = parseRoute(info.route or "")
+  if head:match("^home") then
+    local hx, hy, hz = head:match("^home (%-?%d+) (%-?%d+) (%-?%d+)")
+    st.legs = laneLegs(route, {})
+    st.legs[#st.legs + 1] = { "v", tonumber(hy) }
+    st.leg, st.phase, st.job = 1, "home", nil
+    save()
+    tell("All my work is done; flying home.")
+    return
+  end
+  local id, kind, blocks, name = head:match("^job (%S+) (%S+) (%d+) (.*)$")
+  if not id then say("Odd answer from the job server: " .. head); sleep(30); return end
+  local ax, ay, az = info.at:match("^(%-?%d+) (%-?%d+) (%-?%d+)")
+  local dx, dz = info.dock:match("^(%-?%d+) (%-?%d+)")
+  local ex, ez = info.enter:match("^(%-?%d+) (%-?%d+)")
+  -- the build file
+  local file = get("/plan/" .. id)
+  if not file or not file:match("\nend\n?$") then say("Couldn't download the build file for " .. id .. "; trying again."); sleep(20); return end
+  writeFile(PLAN_FILE, file)
+  local err
+  plan, err = loadPlan()
+  if not plan then say("Build file " .. id .. ": " .. err); sleep(30); return end
+  -- fuel for the trip, before flying (here, between jobs, there's room for the chest above me)
+  if fuelLevel() < TRAVEL_FUEL then st.cell = #plan.xs + 1; restock(nil, TRAVEL_FUEL) end
+  st.job = { id = id, kind = kind, name = name, at = { x = tonumber(ax), y = tonumber(ay), z = tonumber(az) },
+    dock = { x = tonumber(dx), z = tonumber(dz) }, enter = { x = tonumber(ex), z = tonumber(ez) } }
+  st.cell = 1
+  st.legs = laneLegs(route, {})
+  st.legs[#st.legs + 1] = { "v", plan.ys[1] + 1 }                    -- down (or up) the dock column
+  st.legs[#st.legs + 1] = { "h", st.job.enter.x, st.job.enter.z }    -- one step into the job
+  st.leg, st.phase = 1, "go"
+  save()
+  tell(string.format("Job %s: %s, %s blocks. Flying there.", id, name, blocks))
+end
+
+local function build()
+  local total = #plan.xs
+  local lastLayer
+  while st.cell <= total do
+    local i = st.cell
+    if plan.ys[i] ~= lastLayer then
+      lastLayer = plan.ys[i]
+      say(string.format("%s: layer %d (%d%% done)", st.job.id, lastLayer - plan.ys[1], math.floor((i - 1) * 100 / total)))
+      report(true)
+    end
+    placeCell(i)
+    st.cell = i + 1
+    save()
+    report(false)
+  end
+  restock(nil)          -- hand back what's left (and top up fuel)
+  -- out the way I came in: inside the job's own area to the column next to the dock, then into it
+  st.legs = { { "h", st.job.enter.x, pos.z }, { "h", st.job.enter.x, st.job.enter.z }, { "h", st.job.dock.x, st.job.dock.z } }
+  st.leg, st.phase = 1, "leave"
+  save()
+end
+
+local function loop()
+  while true do
+    if st.phase == "ask" then ask()
+    elseif st.phase == "go" then
+      runLegs()
+      st.phase = "build"; save()
+    elseif st.phase == "build" then
+      if not plan then plan = assert(loadPlan()) end
+      build()
+    elseif st.phase == "leave" then
+      runLegs()
+      local name = st.job.name
+      while not get("/done?t=" .. cfg.label .. "&job=" .. st.job.id) do say("Can't reach the job server to say I'm done; trying again."); sleep(30) end
+      st.phase, st.job, plan = "ask", nil, nil
+      if fs.exists(PLAN_FILE) then fs.delete(PLAN_FILE) end
+      save()
+      tell(name .. " is built.")
+    elseif st.phase == "home" then
+      runLegs()
+      st.phase = "ask"; save()
+      turnTo(3)
+      tell("Home.")
+    else
+      error("Unknown phase " .. tostring(st.phase))
+    end
+  end
+end
+
+---------------------------------------------------------------------------------------------------
+-- main
+
+local c = readFile(CFG_FILE)
+cfg = c and textutils.unserialize(c)
+
+if args[1] == "status" then
+  if not cfg or not loadState() then print("Not started. Usage: cityfleet <slot> [server]"); return end
+  print(string.format("cityfleet %s, turtle %s: %s at %d,%d,%d facing %d, fuel %s", VERSION, cfg.label, st.phase, pos.x, pos.y, pos.z, pos.f, tostring(turtle.getFuelLevel())))
+  if st.job then
+    local p = loadPlan()
+    print(string.format("Job %s %s: block %d of %d", st.job.id, st.job.name, st.cell or 0, p and #p.xs or 0))
+  end
+  return
+end
+
+-- Right after a server start the upgrade can take a moment to show up: keep looking for a minute.
+-- (A turtle once stayed idle for an hour because it gave up at once.)
+for _ = 1, 60 do
+  self_ = findSelf()
+  if self_ then break end
+  sleep(1)
+end
+if not self_ then say("I need a Narcissistic upgrade (OpenPeripherals Addons) to see my own inventory."); return end
+
+if args[1] then
+  local slot = tonumber(args[1])
+  if not slot or slot < 1 or slot > 64 then print("Usage: cityfleet <slot> [server] [go]"); return end
+  local server = (args[2] and args[2] ~= "go") and args[2] or DEFAULT_SERVER
+  cfg = { slot = slot, label = "city" .. slot, server = server:gsub("/$", "") }
+  writeFile(CFG_FILE, textutils.serialize(cfg))
+  os.setComputerLabel(cfg.label)
+  local reply = get(string.format("/hello?t=%s&n=%d", cfg.label, slot))
+  local hx, hy, hz = (reply or ""):match("^home (%-?%d+) (%-?%d+) (%-?%d+)")
+  if not hx then print("Can't reach the job server at " .. cfg.server); return end
+  print(string.format("I'm %s. My depot spot is %s,%s,%s.", cfg.label, hx, hy, hz))
+  print("I must be standing on it, facing NORTH, with my Ender Chest in slot 16.")
+  if args[#args] ~= "go" then print("Enter to start, Ctrl+T to cancel."); read() end
+  if turtle.getItemCount(CHEST) == 0 then print("No Ender Chest in slot 16."); return end
+  local cs = self_.getStackInSlot(CHEST)
+  st = { phase = "ask", pos = { x = tonumber(hx), y = tonumber(hy), z = tonumber(hz), f = 3 },
+    home = { x = tonumber(hx), y = tonumber(hy), z = tonumber(hz) }, chest = cs and { id = cs.id, dmg = cs.dmg },
+    lanes = { e = 1e9, w = 1e9, s = 1e9, n = 1e9, wait = 1e9 } }
+  pos = st.pos
+  if fs.exists(PLAN_FILE) then fs.delete(PLAN_FILE) end
+  save()
+elseif not cfg or not loadState() then
+  say("Usage: cityfleet <slot> [server] [go] | cityfleet status"); return
+end
+say(string.format("cityfleet %s starting: %s at %d,%d,%d, fuel %s", VERSION, st.phase, pos.x, pos.y, pos.z, tostring(turtle.getFuelLevel())))
+
+-- a move that happened just before a restart: the fuel says so
+if st.pend then
+  if turtle.getFuelLevel() == st.pend.fuel - 1 then pos.x, pos.y, pos.z = st.pend.x, st.pend.y, st.pend.z end
+  st.pend = nil
+  save()
+end
+if turtle.getItemCount(CHEST) == 0 and turtle.detectUp() then
+  local p = peripheral.wrap("top")
+  if p and p.getAllStacks then pickUpChest() end
+end
+if st.phase == "build" or st.phase == "go" or st.phase == "leave" then plan = loadPlan() end
+rescan()
+if not fs.exists("startup") then writeFile("startup", 'shell.run("cityfleet")\n') end
+
+local ok, err = pcall(loop)
+if not ok then
+  if err == "Terminated" then say("Stopped (Ctrl+T). Run cityfleet to carry on."); return end
+  -- anything else: tell, then start over from the saved state in a minute (Ctrl+T to stop)
+  say("ERROR: " .. tostring(err))
+  pcall(report, true, "ERROR: " .. tostring(err))
+  print("Restarting in 60 s. Ctrl+T to stop.")
+  sleep(60)
+  os.reboot()
+end

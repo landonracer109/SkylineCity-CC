@@ -1,0 +1,834 @@
+<title>Skyline City</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: the city fills the screen; a slim plan sheet on the right; stacks on phones. One dusk/night look by choice. */
+:root {
+  --ink: #f1ede4;
+  --ink-dim: #a3abb6;
+  --panel: #12161d;
+  --panel-2: #1b212b;
+  --line: #2a323e;
+  --gold: #f0b43c;          /* glowstone */
+  --red: #d8402f;           /* redstone */
+  --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: #0c0f14; color: var(--ink); font-family: var(--font-body); font-size: 14px; overflow: hidden; }
+.app { display: grid; grid-template-columns: minmax(0, 1fr) 340px; height: 100%; }
+#view { position: relative; min-width: 0; min-height: 0; }
+#view canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.hint { position: absolute; left: 16px; bottom: 14px; font-size: 12px; color: var(--ink-dim); background: rgba(12,15,20,.75); padding: 6px 10px; border-radius: 6px; pointer-events: none; }
+.loading { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-dim); font-family: var(--font-mono); }
+aside { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding-block: 20px 28px; padding-inline: 20px; display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+h1 { font-family: var(--font-display); font-weight: 800; font-size: 40px; line-height: .95; letter-spacing: 1px; text-transform: uppercase; margin: 0; }
+h1 span { color: var(--gold); }
+.sub { color: var(--ink-dim); margin: 8px 0 0; line-height: 1.45; }
+h2 { font-family: var(--font-display); font-weight: 600; font-size: 16px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--ink-dim); margin: 0 0 8px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.ctrl { display: flex; flex-direction: column; gap: 10px; }
+label { cursor: pointer; }
+input[type=checkbox] { accent-color: var(--gold); width: 16px; height: 16px; }
+input[type=range] { width: 100%; accent-color: var(--gold); }
+.mono { font-family: var(--font-mono); color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+button { font: inherit; font-size: 13px; color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+button.primary { background: var(--gold); color: #1b1305; border-color: var(--gold); font-weight: 600; }
+button:hover { border-color: var(--ink-dim); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font-family: var(--font-display); font-size: 24px; font-weight: 800; line-height: 1; }
+.stat span { font-size: 11px; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 1px; }
+.card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.card h3 { margin: 0; font-family: var(--font-display); font-size: 24px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px; line-height: 1; }
+.card p { margin: 0; color: var(--ink-dim); line-height: 1.45; }
+.bom { width: 100%; border-collapse: collapse; font-size: 13px; }
+.bom td { padding: 4px 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.bom td:last-child { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 8px; vertical-align: -1px; border: 1px solid rgba(255,255,255,.18); }
+.muted { color: var(--ink-dim); font-size: 12px; line-height: 1.45; margin: 0; }
+@media (max-width: 760px) {
+  body { overflow: auto; }
+  .app { grid-template-columns: 1fr; grid-template-rows: 62vh auto; height: auto; }
+  aside { border-left: 0; border-top: 1px solid var(--line); padding-inline: 16px; }
+}
+</style>
+
+<div class="app">
+  <div id="view"><div class="loading" id="loading">Pouring foundations…</div><div class="hint">Click a tower for its block list · drag to orbit · scroll to zoom · right-drag to pan</div></div>
+  <aside>
+    <div>
+      <h1>Skyline <span>City</span></h1>
+      <p class="sub">An 8×8 downtown of Minecraft skyscrapers, tallest in the middle, with merged double lots and superblocks. Every block can be mined or made in bulk; nothing from Chisel or ProjectRed.</p>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b id="sTowers">0</b><span>Towers</span></div>
+      <div class="stat"><b id="sTall">0</b><span>Tallest</span></div>
+      <div class="stat"><b id="sBlocks">0</b><span>Blocks</span></div>
+    </div>
+
+    <section class="ctrl">
+      <h2>City</h2>
+      <div class="row"><button class="primary" id="btnNew">New city</button><span class="mono">seed <span id="seedV"></span></span></div>
+      <div>
+        <div class="row"><label for="maxH">Tallest tower</label><span class="mono" id="maxHv"></span></div>
+        <input type="range" id="maxH" min="60" max="220" step="10" value="170">
+      </div>
+      <div class="row"><label for="cbNight">Night</label><input type="checkbox" id="cbNight"></div>
+    </section>
+
+    <section>
+      <h2>Selected tower</h2>
+      <div class="card" id="info"><p>Click any tower in the city to see its style, size and the blocks it takes to build.</p></div>
+    </section>
+
+    <section>
+      <h2>Roads &amp; lighting</h2>
+      <p class="muted">A highway each way (18 wide, two lanes each side of a barrier), a tree-lined boulevard each way, and streets of 6 or 8. Glowstone light poles line every sidewalk and the highway barriers. Magnum Torches inside the towers stop mobs spawning anywhere in the city: each one covers 128 blocks out but only 32 up and down, so there is a set every 48 blocks of height.</p>
+      <p class="muted" id="lightInfo"></p>
+    </section>
+
+    <section>
+      <h2>Styles</h2>
+      <p class="muted">On single lots: glass office, brick deco, sandstone ziggurat, quartz needle, clay block, twin towers, nether tower, copper deco, electrum &amp; lead, twisting tower, octagon tower, L-block. On double lots: slab tower, podium &amp; towers, gateway. On 2×2 superblocks: landmark supertower, tower cluster. Windows are Extra Utilities Thickened Glass. Metal blocks are Thermal Expansion storage blocks; yellorium is Big Reactors.</p>
+    </section>
+  </aside>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ---------- textures ----------
+function canvasTex(draw) {
+  const c = document.createElement("canvas"); c.width = c.height = 16;
+  draw(c.getContext("2d"));
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter; t.minFilter = THREE.NearestFilter; t.generateMipmaps = false;
+  return t;
+}
+function noise(g, base, amt, seed) {
+  let s = seed;
+  const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  g.fillStyle = base; g.fillRect(0, 0, 16, 16);
+  for (let i = 0; i < 85; i++) { g.fillStyle = `rgba(${rnd() < .5 ? "0,0,0" : "255,255,255"},${amt * rnd()})`; g.fillRect(Math.floor(rnd() * 16), Math.floor(rnd() * 16), 1, 1); }
+}
+function bricks(g, fill, mortar, rows, seed) {
+  noise(g, fill, .08, seed); g.fillStyle = mortar;
+  const rh = 16 / rows;
+  for (let r = 0; r < rows; r++) { g.fillRect(0, r * rh, 16, 1); const off = r % 2 ? 4 : 0; for (let x = off; x < 16; x += 8) g.fillRect(x, r * rh, 1, rh); }
+}
+function framed(g, fill, edge, thick) {
+  g.clearRect(0, 0, 16, 16); g.fillStyle = fill; g.fillRect(0, 0, 16, 16);
+  g.fillStyle = edge; g.fillRect(0, 0, 16, thick); g.fillRect(0, 16 - thick, 16, thick); g.fillRect(0, 0, thick, 16); g.fillRect(16 - thick, 0, thick, 16);
+}
+function metal(g, fill, edge, seed) { noise(g, fill, .06, seed); g.fillStyle = edge; g.fillRect(0, 0, 16, 1); g.fillRect(0, 15, 16, 1); g.fillRect(0, 0, 1, 16); g.fillRect(15, 0, 1, 16); g.fillStyle = "rgba(255,255,255,.25)"; g.fillRect(2, 2, 12, 1); g.fillRect(2, 2, 1, 12); }
+function gem(g, fill, hi, lo, seed) { noise(g, fill, .1, seed); g.fillStyle = hi; g.fillRect(3, 3, 3, 3); g.fillRect(10, 9, 3, 3); g.fillStyle = lo; g.fillRect(0, 15, 16, 1); g.fillRect(15, 0, 1, 16); }
+const M = {
+  stone:     { name: "Smooth stone", color: "#9a9a9a", tex: g => { noise(g, "#9a9a9a", .08, 3); g.fillStyle = "#7f7f7f"; g.fillRect(0, 15, 16, 1); } },
+  stonebrick:{ name: "Stone bricks", color: "#7d7d7d", tex: g => bricks(g, "#7d7d7d", "#5a5a5a", 2, 5) },
+  brick:     { name: "Bricks", color: "#93503d", tex: g => bricks(g, "#93503d", "#c5b7a6", 4, 7) },
+  sand:      { name: "Sandstone", color: "#dacd98", tex: g => { noise(g, "#dacd98", .08, 9); g.fillStyle = "#c9ba82"; g.fillRect(0, 12, 16, 1); } },
+  sandchis:  { name: "Chiseled sandstone", color: "#d2c28b", tex: g => { noise(g, "#d2c28b", .08, 11); g.fillStyle = "#a8975f"; g.fillRect(3, 3, 10, 1); g.fillRect(3, 12, 10, 1); g.fillRect(6, 6, 4, 4); } },
+  quartz:    { name: "Block of quartz", color: "#efece5", tex: g => noise(g, "#efece5", .04, 13) },
+  qpillar:   { name: "Pillar quartz", color: "#e9e6de", tex: g => { noise(g, "#e9e6de", .04, 15); g.fillStyle = "#cfcbc1"; g.fillRect(3, 0, 1, 16); g.fillRect(12, 0, 1, 16); } },
+  nbrick:    { name: "Nether brick", color: "#3a1c20", tex: g => bricks(g, "#3a1c20", "#1e0d10", 4, 17) },
+  obsidian:  { name: "Obsidian", color: "#1a1626", tex: g => noise(g, "#1a1626", .25, 19) },
+  glow:      { name: "Glowstone", color: "#f4cf72", tex: g => noise(g, "#f4cf72", .25, 21), emissive: "#ffc861", glow: 1 },
+  redstone:  { name: "Block of redstone", color: "#b3271b", tex: g => metal(g, "#b3271b", "#6e130b", 23), emissive: "#5d0a05", glow: .8 },
+  lapis:     { name: "Lapis lazuli block", color: "#2747a1", tex: g => gem(g, "#2747a1", "#5d7fd6", "#152a66", 25) },
+  gold:      { name: "Block of gold", color: "#f1c83f", tex: g => metal(g, "#f1c83f", "#b98e17", 27) },
+  iron:      { name: "Block of iron", color: "#dadada", tex: g => metal(g, "#dadada", "#a7a7a7", 29) },
+  diamond:   { name: "Block of diamond", color: "#62dcd2", tex: g => gem(g, "#62dcd2", "#c6fbf6", "#2c9b93", 31) },
+  emerald:   { name: "Block of emerald", color: "#31c35d", tex: g => gem(g, "#31c35d", "#a5f2bc", "#17803a", 33) },
+  copper:    { name: "Copper block (TE)", color: "#d77a3c", tex: g => metal(g, "#d77a3c", "#94471c", 35) },
+  tin:       { name: "Tin block (TE)", color: "#c5d2dc", tex: g => metal(g, "#c5d2dc", "#8796a3", 37) },
+  silver:    { name: "Silver block (TE)", color: "#e6eef4", tex: g => metal(g, "#e6eef4", "#a9b6c0", 39) },
+  lead:      { name: "Lead block (TE)", color: "#4e5874", tex: g => metal(g, "#4e5874", "#2f3549", 41) },
+  electrum:  { name: "Electrum block (TE)", color: "#e8d36a", tex: g => metal(g, "#e8d36a", "#ab9530", 43) },
+  invar:     { name: "Invar block (TE)", color: "#a9b1a3", tex: g => metal(g, "#a9b1a3", "#747c6f", 45) },
+  yellorium: { name: "Yellorium block (Big Reactors)", color: "#cfe23a", tex: g => metal(g, "#cfe23a", "#8a9a14", 47), emissive: "#7f9a10", glow: .9 },
+  clayW:  { name: "White stained clay", color: "#d2b2a1", tex: g => noise(g, "#d2b2a1", .06, 51) },
+  clayO:  { name: "Orange stained clay", color: "#a1531d", tex: g => noise(g, "#a1531d", .06, 52) },
+  clayLG: { name: "Light gray stained clay", color: "#876a61", tex: g => noise(g, "#876a61", .06, 53) },
+  clayC:  { name: "Cyan stained clay", color: "#575b5b", tex: g => noise(g, "#575b5b", .06, 54) },
+  clayB:  { name: "Blue stained clay", color: "#4a3c5b", tex: g => noise(g, "#4a3c5b", .06, 55) },
+  clayR:  { name: "Red stained clay", color: "#8f3d2e", tex: g => noise(g, "#8f3d2e", .06, 56) },
+  clayK:  { name: "Black stained clay", color: "#251610", tex: g => noise(g, "#251610", .06, 57) },
+  clayY:  { name: "Yellow stained clay", color: "#ba8523", tex: g => noise(g, "#ba8523", .06, 58) },
+  glass:  { name: "Thickened glass (Extra Utils)", color: "#a9dbe8", tex: g => framed(g, "rgba(150,205,225,.22)", "rgba(220,240,246,.9)", 2), transparent: true },
+  glassLit: { name: "Thickened glass (Extra Utils)", color: "#a9dbe8", tex: g => framed(g, "rgba(150,205,225,.22)", "rgba(220,240,246,.9)", 2), transparent: true, countAs: "glass" },
+  ironbars: { name: "Iron bars", color: "#8d9298", tex: g => noise(g, "#8d9298", .1, 61), sx: .25 },
+  magnum: { name: "Magnum Torch (Extra Utils)", color: "#c9a14a", tex: g => { noise(g, "#7a5a2a", .2, 71); g.fillStyle = "#ffd25a"; g.fillRect(5, 1, 6, 5); g.fillStyle = "#c9a14a"; g.fillRect(6, 6, 4, 10); }, sx: .5, emissive: "#ffb43a", glow: 1 },
+  grass:  { name: "Grass", color: "#5d973a", tex: g => noise(g, "#5d973a", .2, 63) },
+  log:    { name: "Oak log", color: "#6b4f2e", tex: g => { noise(g, "#6b4f2e", .2, 65); g.fillStyle = "#4e391f"; for (let x = 1; x < 16; x += 4) g.fillRect(x, 0, 1, 16); } },
+  leaves: { name: "Oak leaves", color: "#3f7d2c", tex: g => noise(g, "#3f7d2c", .35, 67) },
+  water:  { name: "Water", color: "#2f6fb5", tex: g => noise(g, "rgba(47,111,181,.75)", .1, 69), transparent: true },
+};
+const CLAYS = ["clayW", "clayO", "clayLG", "clayC", "clayB", "clayR", "clayK", "clayY"];
+
+// ---------- random ----------
+function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function R(seed) { const f = mulberry(seed); return { f, int: (a, b) => a + Math.floor(f() * (b - a + 1)), pick: arr => arr[Math.floor(f() * arr.length)] }; }
+
+// ---------- building helpers ----------
+function makeB(name, style) { return { name, style, m: new Map(), put(x, y, z, k) { this.m.set(x + "," + y + "," + z, k); } }; }
+// perimeter of a box; fn(x, y, z, u, corner) -> block key or null. u runs along each face.
+function shell(b, x0, z0, w, d, y0, y1, fn) {
+  const x1 = x0 + w - 1, z1 = z0 + d - 1;
+  for (let y = y0; y < y1; y++) for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) {
+    if (x !== x0 && x !== x1 && z !== z0 && z !== z1) continue;
+    const corner = (x === x0 || x === x1) && (z === z0 || z === z1);
+    const u = (z === z0 || z === z1) ? x - x0 : z - z0;
+    const k = fn(x, y, z, u, corner, y - y0); if (k) b.put(x, y, z, k);
+  }
+}
+function plate(b, x0, z0, w, d, y, k) { for (let x = x0; x < x0 + w; x++) for (let z = z0; z < z0 + d; z++) b.put(x, y, z, k); }
+function ring(b, x0, z0, w, d, y, k) { shell(b, x0, z0, w, d, y, y + 1, () => k); }
+function lit(r, p) { return r.f() < p ? "glassLit" : "glass"; }
+function tree(b, x, z, y0, r) {
+  const h = r.int(4, 6);
+  for (let y = y0; y < y0 + h; y++) b.put(x, y, z, "log");
+  for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) for (let dy = -1; dy <= 2; dy++) {
+    if (dx * dx + dz * dz + dy * dy * 1.6 <= 5.5 && !(dx === 0 && dz === 0 && dy < 1)) b.put(x + dx, y0 + h - 1 + dy, z + dz, "leaves");
+  }
+}
+function antenna(b, x, z, y0, len, top) { for (let y = y0; y < y0 + len; y++) b.put(x, y, z, "ironbars"); b.put(x, y0 + len, z, top); }
+
+// ---------- tower styles (each fits a 20x20 lot at x0, z0; ground at y 0) ----------
+const STYLES = {
+  office(b, x0, z0, H, r) {
+    const F = r.pick(["quartz", "iron", "stone", "silver", "electrum"]), A = r.pick(["glow", "gold", "lapis", "redstone", "diamond"]);
+    const pat = (u, c, y) => c ? F : (y < 4 ? (u % 4 === 0 ? F : "glass") : (y % 4 === 0 ? F : (u % 4 === 0 ? F : lit(r, .3))));
+    const mid = Math.round(H * .78);
+    shell(b, x0 + 2, z0 + 2, 16, 16, 0, mid, (x, y, z, u, c) => pat(u, c, y));
+    plate(b, x0 + 2, z0 + 2, 16, 16, mid, F); ring(b, x0 + 2, z0 + 2, 16, 16, mid, A);
+    shell(b, x0 + 4, z0 + 4, 12, 12, mid + 1, H, (x, y, z, u, c) => pat(u, c, y));
+    plate(b, x0 + 4, z0 + 4, 12, 12, H, F); ring(b, x0 + 4, z0 + 4, 12, 12, H, A);
+    for (const [x, z] of [[4, 4], [15, 4], [4, 15], [15, 15]]) b.put(x0 + x, H + 1, z0 + z, "glow");
+    antenna(b, x0 + 10, z0 + 10, H + 1, r.int(8, 18), "redstone");
+    b.desc = `${M[F].name} frame with a ${M[A].name.toLowerCase()} band at the setback.`;
+  },
+  brick(b, x0, z0, H, r) {
+    const W = r.pick(["brick", "brick", "clayR", "clayW"]), band = r.pick(["stonebrick", "quartz", "stone"]), crown = r.pick(["gold", "copper", "electrum"]);
+    const tiers = [[0, Math.round(H * .55), 1], [Math.round(H * .55), Math.round(H * .8), 3], [Math.round(H * .8), H, 5]];
+    tiers.forEach(([y0, y1, i], t) => {
+      const w = 20 - 2 * i;
+      shell(b, x0 + i, z0 + i, w, w, y0, y1, (x, y, z, u, c) => c ? band : (y % 12 === 0 ? band : (u % 2 === 1 && y % 3 !== 0 ? lit(r, .35) : W)));
+      plate(b, x0 + i, z0 + i, w, w, y1, band);
+      if (t < 2) for (const [x, z] of [[i, i], [i + w - 1, i], [i, i + w - 1], [i + w - 1, i + w - 1]]) b.put(x0 + x, y1 + 1, z0 + z, "glow");
+    });
+    shell(b, x0 + 5, z0 + 5, 10, 10, H + 1, H + 4, (x, y, z, u) => u % 2 === 0 ? crown : "glass");
+    plate(b, x0 + 5, z0 + 5, 10, 10, H + 4, crown);
+    for (let y = H + 5; y < H + 9; y++) plate(b, x0 + 9, z0 + 9, 2, 2, y, crown);
+    antenna(b, x0 + 9, z0 + 9, H + 9, r.int(6, 14), "glow");
+    b.desc = `${M[W].name} in three Art Deco tiers with a ${M[crown].name.toLowerCase()} crown and spire.`;
+  },
+  ziggurat(b, x0, z0, H, r) {
+    const A = r.pick(["lapis", "gold", "emerald", "diamond"]);
+    let i = 1, y = 0;
+    const step = Math.max(6, Math.round(H / 9));
+    while (y < H && 20 - 2 * i >= 6) {
+      const w = 20 - 2 * i, y1 = Math.min(H, y + step);
+      shell(b, x0 + i, z0 + i, w, w, y, y1, (x, yy, z, u, c, k) => c ? "sandchis" : (u % 3 === 1 && k >= 2 && k <= step - 3 ? lit(r, .25) : "sand"));
+      plate(b, x0 + i, z0 + i, w, w, y1, "sand"); ring(b, x0 + i, z0 + i, w, w, y1, A);
+      y = y1 + 1; i++;
+    }
+    let w = 20 - 2 * i + 2, yy = y;
+    while (w > 1) { plate(b, x0 + 10 - Math.floor(w / 2), z0 + 10 - Math.floor(w / 2), w, w, yy, "sandchis"); w -= 2; yy++; }
+    b.put(x0 + 10, yy, z0 + 10, A); b.put(x0 + 10, yy + 1, z0 + 10, "glow");
+    b.desc = `Stepped sandstone with ${M[A].name.toLowerCase()} on every terrace and a pyramid top.`;
+  },
+  needle(b, x0, z0, H, r) {
+    const A = r.pick(["diamond", "lapis", "emerald", "gold"]);
+    const cx = x0 + 10, cz = z0 + 10, taper = Math.round(H * .8);
+    const rad = y => y < taper ? 8.5 : 8.5 - 5.5 * (y - taper) / (H - taper);
+    let prev = rad(0);
+    for (let y = 0; y <= H; y++) {
+      const rr = rad(y);
+      for (let x = cx - 9; x <= cx + 9; x++) for (let z = cz - 9; z <= cz + 9; z++) {
+        const d = Math.hypot(x + .5 - cx, z + .5 - cz);
+        if (y === H || (rr < prev - .01 && d <= prev && d > rr - 1)) { if (d <= prev) b.put(x, y, z, y === H ? "qpillar" : "quartz"); continue; }
+        if (d <= rr && d > rr - 1.1) {
+          const a = Math.floor((Math.atan2(z + .5 - cz, x + .5 - cx) + Math.PI) / (2 * Math.PI) * 24);
+          b.put(x, y, z, y % 8 === 0 ? A : (a % 3 === 0 ? "qpillar" : lit(r, .3)));
+        }
+      }
+      prev = rr;
+    }
+    antenna(b, cx, cz, H + 1, r.int(14, 24), "glow");
+    b.desc = `Round quartz tower with glass strips, ${M[A].name.toLowerCase()} rings every 8 blocks and a tapered top.`;
+  },
+  clay(b, x0, z0, H, r) {
+    const C = r.pick(CLAYS), T = r.pick(["quartz", "stonebrick", "clayW", "sandchis"]);
+    const wide = r.f() < .5, w = wide ? 18 : 12, d = wide ? 12 : 18, ox = x0 + (20 - w) / 2, oz = z0 + (20 - d) / 2;
+    shell(b, ox, oz, w, d, 0, H, (x, y, z, u, c) => c ? T : (y % 4 !== 0 && u % 3 !== 0 ? lit(r, .3) : C));
+    plate(b, ox, oz, w, d, H, T); ring(b, ox, oz, w, d, H + 1, T);
+    plate(b, ox + 1, oz + 1, w - 2, d - 2, H + 1, "grass");
+    tree(b, ox + 4, oz + 4, H + 2, r); tree(b, ox + w - 5, oz + d - 5, H + 2, r);
+    b.desc = `${M[C].name} office block with ${M[T].name.toLowerCase()} corners and a roof garden.`;
+  },
+  twin(b, x0, z0, H, r) {
+    const F = r.pick(["iron", "silver", "tin", "stone", "quartz"]), A = r.pick(["gold", "glow", "diamond"]);
+    const H2 = Math.round(H * .9), by = Math.round(H * .6);
+    for (const [tx, h] of [[x0 + 1, H], [x0 + 12, H2]]) {
+      shell(b, tx, z0 + 6, 7, 7, 0, h, (x, y, z, u, c) => c ? F : (y % 3 === 0 ? F : lit(r, .3)));
+      plate(b, tx, z0 + 6, 7, 7, h, F); ring(b, tx, z0 + 6, 7, 7, h + 1, A);
+      antenna(b, tx + 3, z0 + 9, h + 1, r.int(5, 10), "redstone");
+    }
+    plate(b, x0 + 8, z0 + 8, 4, 3, by, F); plate(b, x0 + 8, z0 + 8, 4, 3, by + 4, F);
+    for (let x = x0 + 8; x < x0 + 12; x++) for (let y = by + 1; y < by + 4; y++) { b.put(x, y, z0 + 8, "glass"); b.put(x, y, z0 + 10, "glass"); }
+    for (let x = x0 + 8; x < x0 + 12; x++) { b.put(x, by + 4, z0 + 8, A); b.put(x, by + 4, z0 + 10, A); }
+    b.desc = `Two ${M[F].name.toLowerCase()} towers joined by a glass sky bridge trimmed in ${M[A].name.toLowerCase()}.`;
+  },
+  nether(b, x0, z0, H, r) {
+    shell(b, x0 + 3, z0 + 3, 14, 14, 0, H, (x, y, z, u, c) => c ? "obsidian" : (y % 10 === 0 ? "redstone" : ["nbrick", lit(r, .45), "obsidian"][u % 3]));
+    plate(b, x0 + 3, z0 + 3, 14, 14, H, "nbrick");
+    shell(b, x0 + 3, z0 + 3, 14, 14, H + 1, H + 3, (x, y, z, u) => u % 2 ? "nbrick" : null);
+    for (const [x, z] of [[3, 3], [16, 3], [3, 16], [16, 16]]) { for (let y = H + 1; y < H + 7; y++) b.put(x0 + x, y, z0 + z, "obsidian"); b.put(x0 + x, H + 7, z0 + z, "glow"); }
+    antenna(b, x0 + 10, z0 + 10, H + 1, r.int(10, 16), "redstone");
+    b.desc = "Nether brick and obsidian fins, redstone bands every 10 blocks, glowstone-tipped corner spikes.";
+  },
+  copper(b, x0, z0, H, r) {
+    const mid = Math.round(H * .7), A = r.pick(["emerald", "glow", "gold"]);
+    const pat = (u, c, y) => c ? "invar" : (y % 10 === 0 ? "tin" : (u % 3 === 0 ? "invar" : (y % 2 ? lit(r, .3) : "copper")));
+    shell(b, x0 + 2, z0 + 2, 16, 16, 0, mid, (x, y, z, u, c) => pat(u, c, y));
+    plate(b, x0 + 2, z0 + 2, 16, 16, mid, "copper"); ring(b, x0 + 2, z0 + 2, 16, 16, mid + 1, A);
+    shell(b, x0 + 4, z0 + 4, 12, 12, mid + 1, H, (x, y, z, u, c) => pat(u, c, y));
+    let w = 12, y = H;
+    while (w > 0) { plate(b, x0 + 10 - w / 2, z0 + 10 - w / 2, w, w, y, "copper"); ring(b, x0 + 10 - w / 2, z0 + 10 - w / 2, w, w, y, w === 12 ? A : "copper"); w -= 2; y++; }
+    b.put(x0 + 10, y, z0 + 10, "glow");
+    b.desc = `Copper with invar mullions, tin bands every 10 blocks and a stepped copper cap ringed in ${M[A].name.toLowerCase()}.`;
+  },
+  electrum(b, x0, z0, H, r) {
+    shell(b, x0 + 3, z0 + 3, 14, 14, 0, H, (x, y, z, u, c) => c ? "electrum" : (y % 9 === 0 ? "electrum" : (u % 4 === 0 ? "electrum" : (y % 3 === 0 ? "lead" : lit(r, .3)))));
+    plate(b, x0 + 3, z0 + 3, 14, 14, H, "lead");
+    for (let y = H + 1; y <= H + 2; y++) ring(b, x0 + 3, z0 + 3, 14, 14, y, "yellorium");
+    for (let y = H + 1; y < H + 8; y++) plate(b, x0 + 9, z0 + 9, 2, 2, y, y < H + 6 ? "lead" : "yellorium");
+    antenna(b, x0 + 9, z0 + 9, H + 8, r.int(6, 12), "yellorium");
+    b.desc = "Dark lead walls with electrum mullions and bands, topped by a glowing yellorium crown.";
+  },
+};
+const STYLE_NAMES = {
+  office: "Glass office", brick: "Brick deco", ziggurat: "Sandstone ziggurat", needle: "Quartz needle", clay: "Clay block",
+  twin: "Twin towers", nether: "Nether tower", copper: "Copper deco", electrum: "Electrum & lead",
+  twist: "Twisting tower", octagon: "Octagon tower", lshape: "L-block",
+  slab: "Slab tower", combo: "Podium & towers", gate: "Gateway", mega: "Landmark supertower", cluster: "Tower cluster",
+};
+
+// A building of any plan: inside(x, z, y) says which cells are in it at height y. Walls go on the
+// cells at its edge (mat picks the block), roofs on top wherever it stops.
+function prism(b, xa, xb, za, zb, y0, y1, inside, mat, roof) {
+  for (let y = y0; y <= y1; y++) for (let x = xa; x <= xb; x++) for (let z = za; z <= zb; z++) {
+    if (y < y1 && inside(x, z, y)) {
+      if (inside(x + 1, z, y) && inside(x - 1, z, y) && inside(x, z + 1, y) && inside(x, z - 1, y)) continue;
+      const k = mat(x, y, z); if (k) b.put(x, y, z, k);
+    } else if (y > y0 && inside(x, z, y - 1)) b.put(x, y, z, roof);
+  }
+}
+// Build into part of a lot: turn it (quarter turns for squares, half turns otherwise), raise it, or swap x and z.
+function sub(b, x0, z0, W, D, rot, dy, swap) {
+  return {
+    put(x, y, z, k) {
+      let lx = x - x0, lz = z - z0;
+      const w = swap ? D : W, d = swap ? W : D;
+      if (swap) [lx, lz] = [lz, lx];
+      for (let i = 0; i < rot; i++) [lx, lz] = w === d ? [w - 1 - lz, lx] : [w - 1 - lx, d - 1 - lz];
+      b.put(x0 + lx, y + dy, z0 + lz, k);
+    },
+    set desc(v) { b.desc = v; }, get desc() { return b.desc; },
+  };
+}
+function bridge(b, a, c, at, y, alongX, F) {
+  for (let s = Math.min(a, c); s <= Math.max(a, c); s++) for (let w = -1; w <= 1; w++) {
+    const [x, z] = alongX ? [s, at + w] : [at + w, s];
+    b.put(x, y, z, F); b.put(x, y + 4, z, F);
+    if (w !== 0) for (let yy = y + 1; yy < y + 4; yy++) b.put(x, yy, z, "glass");
+  }
+}
+
+Object.assign(STYLES, {
+  twist(b, x0, z0, H, r) {
+    const F = r.pick(["quartz", "silver", "iron", "electrum"]), A = r.pick(["diamond", "emerald", "lapis", "gold", "glow"]);
+    const cx = x0 + 10, cz = z0 + 10, half = 6.5, turn = (r.f() < .5 ? 1 : -1) * Math.PI / 2 * (.7 + .6 * r.f());
+    const loc = (x, z, y) => { const t = turn * y / H, c = Math.cos(t), s = Math.sin(t), px = x + .5 - cx, pz = z + .5 - cz; return [Math.abs(c * px + s * pz), Math.abs(-s * px + c * pz)]; };
+    const inside = (x, z, y) => { const [a, d] = loc(x, z, y); return a <= half && d <= half; };
+    const corner = (x, z, y) => { const [a, d] = loc(x, z, y); return a > half - 1.3 && d > half - 1.3; };
+    prism(b, x0, x0 + 19, z0, z0 + 19, 0, H, inside, (x, y, z) => y % 15 === 0 ? A : (corner(x, z, y) || y % 4 === 0 ? F : lit(r, .3)), F);
+    antenna(b, cx, cz, H + 1, r.int(10, 18), "glow");
+    b.desc = `Every floor turns a little, so this ${M[F].name.toLowerCase()} and glass box spirals as it rises. ${M[A].name} bands every 15 blocks.`;
+  },
+  octagon(b, x0, z0, H, r) {
+    const F = r.pick(["stonebrick", "quartz", "invar", "tin"]), A = r.pick(CLAYS.concat(["lapis", "emerald", "redstone"]));
+    const cx = x0 + 10, cz = z0 + 10, top = Math.round(H * .85);
+    const inside = (x, z, y) => { const px = Math.abs(x + .5 - cx), pz = Math.abs(z + .5 - cz), h = y < top ? 8.5 : 6.5; return px <= h && pz <= h && px + pz <= h * 1.42; };
+    prism(b, x0, x0 + 19, z0, z0 + 19, 0, H, inside, (x, y, z) => y % 6 === 0 ? A : ((x + z) % 3 === 0 ? F : lit(r, .3)), F);
+    for (let y = H + 1; y < H + 5; y++) plate(b, cx - 1, cz - 1, 2, 2, y, A);
+    antenna(b, cx - 1, cz - 1, H + 5, r.int(6, 12), "glow");
+    b.desc = `Eight-sided ${M[F].name.toLowerCase()} tower striped with ${M[A].name.toLowerCase()} every 6 blocks, narrowing near the top.`;
+  },
+  lshape(b, x0, z0, H, r) {
+    const W = r.pick(["brick", "clayW", "clayO", "sand", "stonebrick", "clayC"]), T = r.pick(["quartz", "stonebrick", "nbrick", "sandchis"]);
+    const H2 = Math.round(H * (.5 + .25 * r.f()));
+    const inA = (x, z) => x >= x0 + 1 && x <= x0 + 18 && z >= z0 + 1 && z <= z0 + 8;
+    const inB = (x, z) => x >= x0 + 1 && x <= x0 + 8 && z >= z0 + 1 && z <= z0 + 18;
+    prism(b, x0, x0 + 19, z0, z0 + 19, 0, H, (x, z, y) => (inA(x, z) && y < H) || (inB(x, z) && y < H2),
+      (x, y, z) => y % 9 === 0 ? T : (y % 3 === 0 || (x + z) % 6 === 0 ? W : lit(r, .3)), T);
+    for (let x = x0 + 2; x <= x0 + 7; x++) for (let z = z0 + 10; z <= z0 + 17; z++) b.put(x, H2 + 1, z, "grass");
+    tree(b, x0 + 4, z0 + 14, H2 + 2, r);
+    b.desc = `${M[W].name} L-shaped block with ribbon windows; the low wing has a roof garden.`;
+  },
+});
+
+// wide lots: 46 x 20 (turned for 20 x 46) and 46 x 46
+const WIDE = {
+  slab(b, x0, z0, H, r) {
+    const F = r.pick(["quartz", "stone", "silver", "iron"]), E = r.pick(["lapis", "clayB", "copper", "clayR", "emerald", "nbrick"]);
+    const xa = x0 + 3, za = z0 + 5, h = Math.round(H * .85);
+    shell(b, xa, za, 40, 10, 0, h, (x, y, z, u) => (x === xa || x === xa + 39) ? E : (y % 4 === 0 || u % 3 === 0 ? F : lit(r, .3)));
+    plate(b, xa, za, 40, 10, h, F); ring(b, xa, za, 40, 10, h, E);
+    shell(b, xa + 8, za + 2, 24, 6, h + 1, h + 4, (x, y, z, u, c) => c ? E : F); plate(b, xa + 8, za + 2, 24, 6, h + 4, F);
+    b.desc = `A long, thin ${M[F].name.toLowerCase()} slab, all glass on the wide faces, with solid ${M[E].name.toLowerCase()} ends.`;
+  },
+  combo(b, x0, z0, H, r) {
+    const P = r.int(5, 9), F = r.pick(["stonebrick", "quartz", "sand", "brick"]);
+    shell(b, x0 + 1, z0 + 1, 44, 18, 0, P, (x, y, z, u, c) => c || y === P - 1 ? F : (y < 3 ? "glass" : (u % 4 === 0 ? F : lit(r, .3))));
+    plate(b, x0 + 1, z0 + 1, 44, 18, P, F);
+    const pool = ["office", "brick", "copper", "electrum", "nether", "twist", "octagon", "needle"];
+    const s1 = r.pick(pool), s2 = r.pick(pool.filter(s => s !== s1)), H2 = Math.round(H * (.5 + .3 * r.f()));
+    STYLES[s1](sub(b, x0, z0, 20, 20, r.int(0, 3), P + 1), x0, z0, H - P - 1, r);
+    STYLES[s2](sub(b, x0 + 26, z0, 20, 20, r.int(0, 3), P + 1), x0 + 26, z0, Math.max(18, H2 - P - 1), r);
+    for (let x = x0 + 20; x < x0 + 26; x++) for (let z = z0 + 3; z < z0 + 17; z++) b.put(x, P + 1, z, "grass");
+    tree(b, x0 + 23, z0 + 6, P + 2, r); tree(b, x0 + 23, z0 + 14, P + 2, r);
+    b.desc = `A ${M[F].name.toLowerCase()} podium carrying a ${STYLE_NAMES[s1].toLowerCase()} and a shorter ${STYLE_NAMES[s2].toLowerCase()}, with a garden between them.`;
+  },
+  gate(b, x0, z0, H, r) {
+    const F = r.pick(["quartz", "silver", "stone", "electrum", "obsidian"]), A = r.pick(["gold", "diamond", "redstone", "glow", "emerald"]);
+    const by = H - Math.max(10, Math.round(H * .18));
+    const pat = (u, c, y) => c ? F : (y % 4 === 0 || u % 4 === 0 ? F : lit(r, .3));
+    for (const tx of [x0 + 1, x0 + 31]) shell(b, tx, z0 + 3, 14, 14, 0, H, (x, y, z, u, c) => pat(u, c, y));
+    shell(b, x0 + 1, z0 + 3, 44, 14, by, H, (x, y, z, u, c) => pat(u, c, y));
+    plate(b, x0 + 15, z0 + 3, 16, 14, by - 1, A);
+    plate(b, x0 + 1, z0 + 3, 44, 14, H, F); ring(b, x0 + 1, z0 + 3, 44, 14, H, A);
+    antenna(b, x0 + 8, z0 + 10, H + 1, r.int(6, 12), "redstone"); antenna(b, x0 + 38, z0 + 10, H + 1, r.int(6, 12), "redstone");
+    b.desc = `Two ${M[F].name.toLowerCase()} towers joined across the top by a bridge block, with a ${M[A].name.toLowerCase()} underside. You can see the sky through the middle.`;
+  },
+  mega(b, x0, z0, H, r) {
+    const th = r.pick([{ F: "quartz", A: "gold", C: "diamond" }, { F: "obsidian", A: "glow", C: "redstone" }, { F: "silver", A: "lapis", C: "diamond" },
+                       { F: "copper", A: "emerald", C: "gold" }, { F: "iron", A: "electrum", C: "yellorium" }]);
+    const cx = x0 + 23, cz = z0 + 23, P = 8, sh = Math.round(H * .3);
+    shell(b, x0 + 1, z0 + 1, 44, 44, 0, P, (x, y, z, u, c) => c || y === P - 1 ? th.F : (y < 4 ? "glass" : (u % 4 === 0 ? th.F : lit(r, .3))));
+    plate(b, x0 + 1, z0 + 1, 44, 44, P, th.F);
+    for (const [ox, oz] of [[3, 3], [35, 3], [3, 35], [35, 35]]) {
+      shell(b, x0 + ox, z0 + oz, 8, 8, P + 1, P + 1 + sh, (x, y, z, u, c) => c || y % 4 === 0 ? th.F : lit(r, .3));
+      plate(b, x0 + ox, z0 + oz, 8, 8, P + 1 + sh, th.F); ring(b, x0 + ox, z0 + oz, 8, 8, P + 1 + sh, th.A);
+    }
+    const half = y => y < H * .4 ? 13.5 : y < H * .65 ? 11 : y < H * .82 ? 8.5 : y < H * .93 ? 6 : 4;
+    const inside = (x, z, y) => { const px = Math.abs(x + .5 - cx), pz = Math.abs(z + .5 - cz), h = half(y); return px <= h && pz <= h && px + pz <= h * 1.6; };
+    prism(b, x0, x0 + 45, z0, z0 + 45, P + 1, H, inside, (x, y, z) => y % 8 === 0 ? th.A : ((x + z) % 4 === 0 ? th.F : lit(r, .3)), th.F);
+    for (let y = H + 1; y < H + 7; y++) plate(b, cx - 1, cz - 1, 2, 2, y, th.C);
+    antenna(b, cx, cz, H + 7, r.int(16, 26), "glow");
+    b.desc = `The city's landmark: a stepped, chamfered ${M[th.F].name.toLowerCase()} supertower with ${M[th.A].name.toLowerCase()} bands, a ${M[th.C].name.toLowerCase()} spire, and four corner towers on a shared podium.`;
+  },
+  cluster(b, x0, z0, H, r) {
+    const F = r.pick(["quartz", "silver", "tin", "iron"]), accents = ["diamond", "emerald", "lapis", "gold"];
+    const cx = x0 + 23, cz = z0 + 23, P = 4;
+    prism(b, x0, x0 + 45, z0, z0 + 45, 0, P, (x, z) => Math.hypot(x + .5 - cx, z + .5 - cz) <= 21.5, (x, y) => y < 3 ? "glass" : F, F);
+    const hs = [1, .82, .66, .5].sort(() => r.f() - .5), spots = [[-11, -11], [11, -11], [-11, 11], [11, 11]], tops = [];
+    spots.forEach(([ox, oz], i) => {
+      const tx = cx + ox, tz = cz + oz, h = Math.max(P + 24, Math.round(H * hs[i])), A = accents[i];
+      prism(b, tx - 8, tx + 8, tz - 8, tz + 8, P + 1, h, (x, z) => Math.hypot(x + .5 - tx, z + .5 - tz) <= 7.5,
+        (x, y, z) => y % 7 === 0 ? A : (Math.floor((Math.atan2(z + .5 - tz, x + .5 - tx) + Math.PI) / (2 * Math.PI) * 20) % 2 ? lit(r, .3) : F), F);
+      antenna(b, tx, tz, h + 1, r.int(5, 12), "glow"); tops.push(h);
+    });
+    const by = (a, c) => Math.round(Math.min(tops[a], tops[c]) * .55);
+    bridge(b, cx - 3, cx + 3, cz - 11, by(0, 1), true, F); bridge(b, cx - 3, cx + 3, cz + 11, by(2, 3), true, F);
+    bridge(b, cz - 3, cz + 3, cx - 11, by(0, 2), false, F); bridge(b, cz - 3, cz + 3, cx + 11, by(1, 3), false, F);
+    b.desc = `Four round ${M[F].name.toLowerCase()} towers of different heights on a round podium, each ringed in its own gem block and linked by glass sky bridges.`;
+  },
+};
+
+function park(b, x0, z0, r, plaza) {
+  plate(b, x0, z0, 20, 20, 0, "grass");
+  if (plaza) {
+    for (let x = 4; x < 16; x++) for (let z = 4; z < 16; z++) { const d = Math.hypot(x - 9.5, z - 9.5); if (d < 6) b.put(x0 + x, 0, z0 + z, d > 5 ? "quartz" : "water"); }
+    for (let y = 1; y < 6; y++) b.put(x0 + 10, y, z0 + 10, "qpillar");
+    b.put(x0 + 10, 6, z0 + 10, "glow");
+    for (const [x, z] of [[2, 2], [17, 2], [2, 17], [17, 17]]) tree(b, x0 + x, z0 + z, 1, r);
+  } else {
+    for (let x = 7; x < 13; x++) for (let z = 8; z < 12; z++) b.put(x0 + x, 0, z0 + z, "water");
+    for (let i = 0; i < 5; i++) tree(b, x0 + r.int(2, 17), z0 + r.pick([r.int(2, 5), r.int(14, 17)]), 1, r);
+  }
+  for (const [x, z] of [[0, 0], [19, 0], [0, 19], [19, 19]]) { for (let y = 1; y < 4; y++) b.put(x0 + x, y, z0 + z, "ironbars"); b.put(x0 + x, 4, z0 + z, "glow"); }
+  b.desc = plaza ? "Central plaza with a quartz fountain and glowstone lamp posts." : "Pocket park with a pond, trees and lamp posts.";
+}
+
+// ---------- city ----------
+// Lots come in columns and rows of different sizes (20-28 blocks). The roads between them vary: a
+// highway each way (18 wide: two lanes each side of a barrier), a boulevard each way (12 wide with a
+// planted median), and streets of 6 or 8. Buildings sit at a random spot inside their lot, so their
+// fronts don't line up. Glowstone light poles line every street, and Magnum Torches inside the towers
+// keep mobs from spawning anywhere in the city (see placeTorches).
+const GRID = 8;
+let SPAN = 260;   // the larger side of the current city (set by each layout)
+const HWY = 18, BLVD = 12;
+function generate(seed, maxH, ceiling) {   // ceiling: the most blocks tall anything may be (building in the world); none in the viewer
+  const r = R(seed), list = [];
+  const cw = [], rh = [], rx = [], rz = [];
+  for (let i = 0; i < GRID; i++) { cw.push(r.int(20, 28)); rh.push(r.int(20, 28)); }
+  for (let k = 0; k <= GRID; k++) { rx.push(k === 0 || k === GRID || r.f() < .7 ? 6 : 8); rz.push(k === 0 || k === GRID || r.f() < .7 ? 6 : 8); }
+  const pickTwo = () => { const a = r.int(2, GRID - 2); let b = r.int(1, GRID - 1); while (Math.abs(b - a) < 2) b = r.int(1, GRID - 1); return [a, b]; };
+  const [hx, bx] = pickTwo(), [hz, bz] = pickTwo();
+  rx[hx] = HWY; rz[hz] = HWY; rx[bx] = BLVD; rz[bz] = BLVD;
+  const lx = [], lz = [], roadX = [], roadZ = [];
+  let p = 0;
+  for (let i = 0; i <= GRID; i++) { roadX.push(p); p += rx[i]; if (i < GRID) { lx.push(p); p += cw[i]; } }
+  const spanX = p;
+  p = 0;
+  for (let j = 0; j <= GRID; j++) { roadZ.push(p); p += rz[j]; if (j < GRID) { lz.push(p); p += rh[j]; } }
+  const spanZ = p;
+  SPAN = Math.max(spanX, spanZ);
+
+  const cell = Array.from({ length: GRID }, () => Array(GRID).fill(null));
+  const lots = [];
+  // lots never merge across a highway or a boulevard
+  const free = (i, j) => i >= 0 && j >= 0 && i < GRID && j < GRID && !cell[i][j];
+  const openX = i => rx[i + 1] <= 8, openZ = j => rz[j + 1] <= 8;
+  const claim = (i, j, w, d, kind) => { const lot = { i, j, w, d, kind }; for (let a = 0; a < w; a++) for (let c = 0; c < d; c++) cell[i + a][j + c] = lot; lots.push(lot); return lot; };
+  const mid = (GRID - 2) / 2, quad = [];
+  for (let i = 0; i < GRID - 1; i++) for (let j = 0; j < GRID - 1; j++) quad.push([i, j, Math.hypot(i - mid, j - mid)]);
+  quad.sort((a, c) => a[2] - c[2]);
+  const okQ = ([i, j]) => free(i, j) && free(i + 1, j) && free(i, j + 1) && free(i + 1, j + 1) && openX(i) && openZ(j);
+  const first = quad.filter(okQ).slice(0, 4);
+  if (first.length) { const [i, j] = r.pick(first); claim(i, j, 2, 2, r.f() < .6 ? "mega" : "cluster"); }
+  if (r.f() < .65) { const far = quad.filter(q => okQ(q) && q[2] > 2.2); if (far.length) { const [i, j] = r.pick(far); claim(i, j, 2, 2, lots[0] && lots[0].kind === "mega" ? "cluster" : "mega"); } }
+  for (let n = 0; n < 8; n++) for (let t = 0; t < 40; t++) {
+    const i = r.int(0, GRID - 1), j = r.int(0, GRID - 1), h = r.f() < .5;
+    if (h ? free(i, j) && free(i + 1, j) && openX(i) : free(i, j) && free(i, j + 1) && openZ(j)) { claim(i, j, h ? 2 : 1, h ? 1 : 2, "wide"); break; }
+  }
+  for (let i = 0; i < GRID; i++) for (let j = 0; j < GRID; j++) if (free(i, j)) claim(i, j, 1, 1, "single");
+  const singles = lots.filter(l => l.kind === "single").sort((a, c) => Math.hypot(a.i - mid - .5, a.j - mid - .5) - Math.hypot(c.i - mid - .5, c.j - mid - .5));
+  if (singles.length) singles[0].kind = "plaza";
+
+  for (const lot of lots) {
+    const x0 = lx[lot.i], z0 = lz[lot.j];
+    let W = 0, D = 0;
+    for (let a = 0; a < lot.w; a++) W += cw[lot.i + a] + (a ? rx[lot.i + a] : 0);
+    for (let c = 0; c < lot.d; c++) D += rh[lot.j + c] + (c ? rz[lot.j + c] : 0);
+    lot.x0 = x0; lot.z0 = z0; lot.W = W; lot.D = D;
+    const dist = Math.hypot((x0 + W / 2) / spanX * GRID - GRID / 2, (z0 + D / 2) / spanZ * GRID - GRID / 2);
+    let H = Math.round(22 + Math.max(0, 1 - dist / 5) * (maxH - 22) + (r.f() - .5) * 30);
+    H = Math.max(18, Math.min(maxH, H));
+    const spot = (fw, fd) => [x0 + r.int(0, Math.max(0, W - fw)), z0 + r.int(0, Math.max(0, D - fd))];
+    let b;
+    if (lot.kind === "plaza") { b = makeB("Central Plaza", "park"); park(b, x0 + Math.floor((W - 20) / 2), z0 + Math.floor((D - 20) / 2), r, true); }
+    else if (lot.kind === "single" && dist > 2 && r.f() < .09) { b = makeB("Pocket Park", "park"); const [ax, az] = spot(20, 20); park(b, ax, az, r, false); }
+    else if (lot.kind === "mega") { H = Math.min(232, Math.round(Math.max(H, maxH) * 1.1)); b = makeB(STYLE_NAMES.mega, "mega"); const [ax, az] = spot(46, 46); WIDE.mega(b, ax, az, H, r); }
+    else if (lot.kind === "cluster") { H = Math.max(H, Math.round(maxH * .7)); b = makeB(STYLE_NAMES.cluster, "cluster"); const [ax, az] = spot(46, 46); WIDE.cluster(b, ax, az, H, r); }
+    else if (lot.kind === "wide") {
+      const st = H >= 45 ? r.pick(["slab", "combo", "combo", "gate", "gate"]) : "slab";
+      b = makeB(STYLE_NAMES[st], st);
+      const tall = lot.d > 1, [ax, az] = tall ? spot(20, 46) : spot(46, 20);
+      WIDE[st](sub(b, ax, az, 46, 20, r.f() < .5 ? 2 : 0, 0, tall), ax, az, H, r);
+    } else {
+      const pool = H < 50 ? ["clay", "clay", "brick", "ziggurat", "nether", "copper", "lshape", "octagon"]
+                          : ["office", "office", "needle", "twin", "brick", "electrum", "nether", "copper", "ziggurat", "twist", "twist", "octagon", "lshape"];
+      const st = r.pick(pool);
+      b = makeB(STYLE_NAMES[st], st);
+      const [ax, az] = spot(20, 20);
+      STYLES[st](sub(b, ax, az, 20, 20, r.int(0, 3), 0), ax, az, H, r);
+    }
+    b.height = H; b.lot = lot; list.push(b);
+  }
+
+  // street lights and trees (one "building" of their own, so they get a block list too)
+  const street = makeB("Street lights & trees", "street");
+  const pole = (x, z, h) => { for (let y = 0; y < h; y++) street.put(x, y, z, "ironbars"); street.put(x, h, z, "glow"); };
+  // a pole every 9 blocks on the sidewalk round every lot
+  for (const lot of lots) {
+    const x0 = lot.x0 - 1, z0 = lot.z0 - 1, x1 = lot.x0 + lot.W, z1 = lot.z0 + lot.D;
+    for (let x = x0; x <= x1; x += 9) { pole(x, z0, 4); pole(x, z1, 4); }
+    for (let z = z0 + 9; z < z1; z += 9) { pole(x0, z, 4); pole(x1, z, 4); }
+    pole(x1, z1, 4);
+  }
+  // taller double lights down the highway barriers, trees down the boulevard medians
+  const alongLots = (v, starts, sizes) => starts.some((s, i) => v >= s + 1 && v <= s + sizes[i] - 2);   // not in a crossing
+  for (let z = 4; z < spanZ - 4; z += 12) if (alongLots(z, lz, rh)) pole(roadX[hx] + 9, z, 7);
+  for (let x = 4; x < spanX - 4; x += 12) if (alongLots(x, lx, cw)) pole(x, roadZ[hz] + 9, 7);
+  for (let j = 0; j < GRID; j++) for (let z = lz[j] + 3; z < lz[j] + rh[j] - 2; z += 7) tree(street, roadX[bx] + 5, z, 0, r);
+  for (let i = 0; i < GRID; i++) for (let x = lx[i] + 3; x < lx[i] + cw[i] - 2; x += 7) tree(street, x, roadZ[bz] + 5, 0, r);
+  list.push(street);
+
+  if (ceiling) for (const b of list) squash(b, ceiling);
+  placeTorches(list, spanX, spanZ);
+  return { list, layout: { cell, lots, cw, rh, rx, rz, lx, lz, roadX, roadZ, spanX, spanZ, hx, hz, bx, bz } };
+}
+
+// Magnum Torches (Extra Utilities) stop mobs spawning inside an oval around them: 128 blocks out,
+// 32 up and down at the torch, less further out. A column of them every ~120 blocks across the city,
+// one every 48 blocks up, covers everything from the street to the tallest roof. Each goes inside a
+// tower that reaches that height, on a block of the tower's own material sticking in from its wall.
+// A building taller than the world allows loses floors from the middle of its shaft: base, crown and
+// spire stay as they are. It uses no random numbers, so every other building stays exactly the same.
+function squash(b, limit) {
+  let top = 0;
+  for (const k of b.m.keys()) top = Math.max(top, +k.split(",")[1] + 1);
+  if (top <= limit) return;
+  const cut = top - limit, y0 = Math.round(top * .45), m = new Map();
+  for (const [k, v] of b.m) {
+    const [x, y, z] = k.split(",").map(Number);
+    if (y < y0) m.set(k, v);
+    else if (y >= y0 + cut) m.set(x + "," + (y - cut) + "," + z, v);
+  }
+  b.m = m; b.height -= cut; b.squashed = cut;
+}
+
+function placeTorches(list, spanX, spanZ) {
+  const towers = list.filter(b => b.height && b.style !== "park" && b.style !== "street");
+  // each tower's footprint at every height, worked out once
+  let top = 0;
+  for (const b of towers) {
+    b.boxes = new Map();
+    for (const k of b.m.keys()) {
+      const [x, y, z] = k.split(",").map(Number);
+      top = Math.max(top, y);
+      const e = b.boxes.get(y);
+      if (!e) b.boxes.set(y, [x, x, z, z]);
+      else { if (x < e[0]) e[0] = x; if (x > e[1]) e[1] = x; if (z < e[2]) e[2] = z; if (z > e[3]) e[3] = z; }
+    }
+  }
+  const nx = Math.ceil(spanX / 120), nz = Math.ceil(spanZ / 120);
+  for (let a = 0; a < nx; a++) for (let c = 0; c < nz; c++) {
+    const px = (a + .5) * spanX / nx, pz = (c + .5) * spanZ / nz;
+    for (let y = 12; y <= top + 12; y += 48) {
+      // the nearest tower that is wide enough at this height, with a torch spot inside it
+      const cands = [];
+      for (const b of towers) {
+        const e = b.boxes.get(y);
+        if (!e || e[1] - e[0] < 4 || e[3] - e[2] < 4) continue;
+        cands.push({ b, x0: e[0], x1: e[1], z0: e[2], z1: e[3], d: Math.hypot((e[0] + e[1]) / 2 - px, (e[2] + e[3]) / 2 - pz) });
+      }
+      cands.sort((p, q) => p.d - q.d);
+      for (const c of cands) {
+        const b = c.b, cx = Math.round((c.x0 + c.x1) / 2), cz = Math.round((c.z0 + c.z1) / 2);
+        const has = (x, yy, z) => b.m.has(x + "," + yy + "," + z);
+        // walk from the middle towards the west wall and stop next to it: that's the spot
+        let x = cx;
+        while (x > c.x0 && !has(x - 1, y, cz)) x--;
+        if (x <= c.x0 || has(x, y, cz) || has(x, y + 1, cz) || has(x, y - 1, cz)) continue;
+        const wall = b.m.get((x - 1) + "," + y + "," + cz);
+        b.put(x, y - 1, cz, wall === "glass" || wall === "glassLit" ? "stone" : wall);   // the shelf
+        b.put(x, y, cz, "magnum");
+        b.torches = (b.torches || 0) + 1;
+        break;
+      }
+    }
+  }
+  // Then make sure: every spot a mob could spawn on (the top of a solid block that doesn't glow and
+  // isn't glass, leaves or bars, plus open ground) must be inside a torch's range. Where one isn't,
+  // put an extra torch on that roof.
+  const NO_SPAWN = new Set(["glass", "glassLit", "ironbars", "leaves", "glow", "magnum", "water", "yellorium", "redstone"]);
+  const owner = new Map(), torches = [];
+  for (const b of list) for (const [k, v] of b.m) { owner.set(k, b); if (v === "magnum") torches.push(k.split(",").map(Number)); }
+  const covered = (x, y, z) => torches.some(([tx, ty, tz]) => {
+    const dx = tx + .5 - x, dy = ty + .5 - y, dz = tz + .5 - z;
+    return (dx * dx + dz * dz) / 16384 + dy * dy / 1024 <= 1;
+  });
+  const spots = [];
+  for (const [k, b] of owner) {
+    if (NO_SPAWN.has(b.m.get(k))) continue;
+    const [x, y, z] = k.split(",").map(Number);
+    if (!owner.has(x + "," + (y + 1) + "," + z) && !owner.has(x + "," + (y + 2) + "," + z)) spots.push([x, y + 1, z, b]);
+  }
+  for (let x = 0; x < spanX; x += 2) for (let z = 0; z < spanZ; z += 2) if (!owner.has(x + ",0," + z)) spots.push([x, 0, z, null]);
+  spots.sort((p, q) => q[1] - p[1]);
+  for (const [x, y, z, b] of spots) {
+    if (covered(x + .5, y, z + .5)) continue;
+    const host = b || list.find(s => s.style === "street");
+    host.put(x, y, z, "magnum");
+    host.torches = (host.torches || 0) + 1;
+    owner.set(x + "," + y + "," + z, host);
+    torches.push([x, y, z]);
+  }
+}
+
+// ---------- scene ----------
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.5, 3000);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(SPAN / 2, 40, SPAN / 2);
+camera.position.set(SPAN / 2 + 230, 260, SPAN / 2 + 270);
+controls.update();
+const hemi = new THREE.HemisphereLight("#d7e6ff", "#3b3328", .9); scene.add(hemi);
+const sun = new THREE.DirectionalLight("#fff1dc", .8); sun.position.set(300, 500, 200); scene.add(sun);
+
+const mats = {};
+for (const [k, d] of Object.entries(M)) {
+  const m = new THREE.MeshLambertMaterial({ map: canvasTex(d.tex), transparent: !!d.transparent, depthWrite: !d.transparent });
+  if (d.emissive) m.emissive = new THREE.Color(d.emissive);
+  mats[k] = m;
+}
+// ground: outskirts, roads of their own widths, the highways' centre barrier and white lane lines,
+// the boulevards' planted medians, a sidewalk under every lot, yellow centre dashes on the streets
+const ground = new THREE.Group(); scene.add(ground);
+const outskirtsMat = new THREE.MeshLambertMaterial({ color: "#4b5a3f" });
+const asphaltMat = new THREE.MeshLambertMaterial({ color: "#30343a" });
+const walkMat = new THREE.MeshLambertMaterial({ color: "#9d9a93" });
+const barrierMat = new THREE.MeshLambertMaterial({ color: "#a8a8a2" });
+const medianMat = new THREE.MeshLambertMaterial({ color: "#56803c" });
+const dashMat = new THREE.MeshBasicMaterial({ color: "#d9b54a" });
+const laneMat = new THREE.MeshBasicMaterial({ color: "#e8e8e8" });
+function buildGround(L) {
+  while (ground.children.length) { const c = ground.children.pop(); if (c.geometry) c.geometry.dispose(); }
+  const add = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); ground.add(m); return m; };
+  const out = add(new THREE.PlaneGeometry(L.spanX + 500, L.spanZ + 500), outskirtsMat, L.spanX / 2, -.3, L.spanZ / 2); out.rotation.x = -Math.PI / 2;
+  for (let k = 0; k <= GRID; k++) {
+    add(new THREE.BoxGeometry(L.rx[k], .2, L.spanZ), asphaltMat, L.roadX[k] + L.rx[k] / 2, -.1, L.spanZ / 2);
+    add(new THREE.BoxGeometry(L.spanX, .2, L.rz[k]), asphaltMat, L.spanX / 2, -.1, L.roadZ[k] + L.rz[k] / 2);
+  }
+  // highway barriers (2 wide, down the middle) and boulevard medians
+  add(new THREE.BoxGeometry(2, .9, L.spanZ), barrierMat, L.roadX[L.hx] + 9, .25, L.spanZ / 2);
+  add(new THREE.BoxGeometry(L.spanX, .9, 2), barrierMat, L.spanX / 2, .25, L.roadZ[L.hz] + 9);
+  add(new THREE.BoxGeometry(2, .4, L.spanZ), medianMat, L.roadX[L.bx] + 6, -.05, L.spanZ / 2);
+  add(new THREE.BoxGeometry(L.spanX, .4, 2), medianMat, L.spanX / 2, -.05, L.roadZ[L.bz] + 6);
+  for (const lot of L.lots) add(new THREE.BoxGeometry(lot.W + 2, .3, lot.D + 2), walkMat, lot.x0 + lot.W / 2, -.13, lot.z0 + lot.D / 2);
+  const dashGeo = new THREE.PlaneGeometry(2, .35);
+  const flat = (m, alongZ) => { m.rotation.x = -Math.PI / 2; if (alongZ) m.rotation.z = Math.PI / 2; };
+  // white lane lines on the highways: one per side, between its two lanes
+  for (let t = 0; t < L.spanZ; t += 5) for (const off of [4, 14]) flat(add(dashGeo, laneMat, L.roadX[L.hx] + off, .02, t + 2), true);
+  for (let t = 0; t < L.spanX; t += 5) for (const off of [4, 14]) flat(add(dashGeo, laneMat, t + 2, .02, L.roadZ[L.hz] + off), false);
+  // yellow centre dashes on the streets, skipped where a merged lot covers the street
+  const same = (a, b) => a && b && typeof a === "object" && a === b;
+  const cellAt = (i, j) => (i >= 0 && j >= 0 && i < GRID && j < GRID) ? L.cell[i][j] : null;
+  for (let k = 0; k <= GRID; k++) for (let s = 0; s < GRID; s++) {
+    if (L.rx[k] <= 8 && !same(cellAt(k - 1, s), cellAt(k, s)))
+      for (let t = L.lz[s]; t < L.lz[s] + L.rh[s]; t += 5) flat(add(dashGeo, dashMat, L.roadX[k] + L.rx[k] / 2, .02, t + 2), true);
+    if (L.rz[k] <= 8 && !same(cellAt(s, k - 1), cellAt(s, k)))
+      for (let t = L.lx[s]; t < L.lx[s] + L.cw[s]; t += 5) flat(add(dashGeo, dashMat, t + 2, .02, L.roadZ[k] + L.rz[k] / 2), false);
+  }
+}
+
+let city = [], meshes = [], selBox = null, selected = -1;
+const fmt = n => n.toLocaleString("en-US");
+function buildScene(seed, maxH) {
+  for (const m of meshes) { scene.remove(m); m.geometry.dispose(); }
+  meshes = []; if (selBox) { scene.remove(selBox); selBox = null; } selected = -1;
+  const gen = generate(seed, maxH); city = gen.list; buildGround(gen.layout);
+  controls.target.set(gen.layout.spanX / 2, 40, gen.layout.spanZ / 2);
+  camera.position.set(gen.layout.spanX / 2 + 250, 290, gen.layout.spanZ / 2 + 300); controls.update();
+  const per = {};
+  city.forEach((b, id) => {
+    let lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (const [key, k] of b.m) {
+      const p = key.split(",").map(Number);
+      (per[k] = per[k] || []).push(p[0], p[1], p[2], id);
+      for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], p[a]); hi[a] = Math.max(hi[a], p[a]); }
+    }
+    b.lo = lo; b.hi = hi;
+  });
+  const dummy = new THREE.Object3D();
+  for (const [k, arr] of Object.entries(per)) {
+    const n = arr.length / 4, d = M[k], sx = d.sx || 1;
+    const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(sx, 1, sx), mats[k], n);
+    const owner = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      dummy.position.set(arr[i * 4] + .5, arr[i * 4 + 1] + .5, arr[i * 4 + 2] + .5); dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix); owner[i] = arr[i * 4 + 3];
+    }
+    mesh.userData.owner = owner; mesh.frustumCulled = false;
+    if (d.transparent) mesh.renderOrder = 2;
+    scene.add(mesh); meshes.push(mesh);
+  }
+  const towers = city.filter(b => b.height);
+  let blocks = 0; for (const b of city) blocks += b.m.size;
+  document.getElementById("sTowers").textContent = towers.length;
+  document.getElementById("sTall").textContent = Math.max(...city.map(b => b.hi[1] + 1));
+  document.getElementById("sBlocks").textContent = blocks >= 1e6 ? (blocks / 1e6).toFixed(2) + "M" : Math.round(blocks / 1000) + "k";
+  document.getElementById("seedV").textContent = seed;
+  let torches = 0, poles = 0;
+  for (const b of city) { torches += b.torches || 0; if (b.style === "street") for (const k of b.m.values()) if (k === "glow") poles++; }
+  document.getElementById("lightInfo").textContent = `This city: ${fmt(poles)} light poles and ${torches} Magnum Torches. Click a tower to see if it carries any.`;
+  showInfo(-1);
+  render();
+}
+
+function showInfo(id) {
+  const box = document.getElementById("info");
+  if (selBox) { scene.remove(selBox); selBox = null; }
+  if (id < 0 || !city[id] || city[id].style === "street") { box.innerHTML = "<p>Click any tower in the city to see its style, size and the blocks it takes to build.</p>"; render(); return; }
+  const b = city[id];
+  const counts = {};
+  for (const k of b.m.values()) { const kk = M[k].countAs || k; counts[kk] = (counts[kk] || 0) + 1; }
+  const rows = Object.entries(counts).sort((a, c) => c[1] - a[1]).map(([k, n]) =>
+    `<tr><td><span class="sw" style="background:${M[k].color}"></span>${M[k].name}</td><td>${fmt(n)}${n >= 64 ? ` <span class="mono">(${(n / 64).toFixed(n >= 640 ? 0 : 1)} st)</span>` : ""}</td></tr>`).join("");
+  const w = b.hi[0] - b.lo[0] + 1, d = b.hi[2] - b.lo[2] + 1, h = b.hi[1] + 1;
+  box.innerHTML = `<h3>${b.name}</h3><p>${b.desc || ""}</p><p class="mono">${w} × ${d} · ${h} tall · ${fmt(b.m.size)} blocks</p><table class="bom">${rows}</table>`;
+  const g = new THREE.BoxGeometry(w + .4, h + .4, d + .4);
+  selBox = new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: "#f0b43c" }));
+  selBox.position.set(b.lo[0] + w / 2, h / 2, b.lo[2] + d / 2); scene.add(selBox);
+  render();
+}
+
+// click to select (ignore drags)
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+let downAt = null;
+renderer.domElement.addEventListener("pointerdown", e => { downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener("pointerup", e => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.set((e.clientX - rect.left) / rect.width * 2 - 1, -(e.clientY - rect.top) / rect.height * 2 + 1);
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects(meshes, false);
+  const hit = hits.find(h => h.instanceId !== undefined);
+  showInfo(hit ? hit.object.userData.owner[hit.instanceId] : -1);
+});
+
+// day / night
+const cbNight = document.getElementById("cbNight");
+function applyNight() {
+  const n = cbNight.checked;
+  scene.background = new THREE.Color(n ? "#0a0e1a" : "#9cc3e6");
+  scene.fog = new THREE.Fog(n ? "#0a0e1a" : "#9cc3e6", 500, 1400);
+  hemi.intensity = n ? .28 : .9; sun.intensity = n ? .12 : .8;
+  for (const [k, d] of Object.entries(M)) if (d.glow) mats[k].emissiveIntensity = n ? 1.6 * d.glow : .6 * d.glow;
+  mats.glassLit.emissive = new THREE.Color(n ? "#ffbf5e" : "#000000"); mats.glassLit.emissiveIntensity = n ? .9 : 0;
+  walkMat.color.set(n ? "#4a4842" : "#9d9a93"); asphaltMat.color.set(n ? "#16181c" : "#30343a"); outskirtsMat.color.set(n ? "#1a2016" : "#4b5a3f"); barrierMat.color.set(n ? "#4a4a46" : "#a8a8a2"); medianMat.color.set(n ? "#1f2e17" : "#56803c");
+  render();
+}
+cbNight.addEventListener("change", applyNight);
+
+// controls
+let seed = Math.floor(Math.random() * 99999) + 1;
+const maxH = document.getElementById("maxH"), maxHv = document.getElementById("maxHv");
+try { const s = +localStorage.getItem("city.seed"); if (s > 0) seed = s; } catch (e) {}
+maxHv.textContent = maxH.value + " blocks";
+maxH.addEventListener("input", () => { maxHv.textContent = maxH.value + " blocks"; });
+maxH.addEventListener("change", () => buildScene(seed, +maxH.value));
+document.getElementById("btnNew").addEventListener("click", () => {
+  seed = Math.floor(Math.random() * 99999) + 1;
+  try { localStorage.setItem("city.seed", seed); } catch (e) {}
+  buildScene(seed, +maxH.value);
+});
+
+let needs = true;
+const render = () => { needs = true; };
+controls.addEventListener("change", render);
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix(); render();
+}
+new ResizeObserver(resize).observe(view);
+resize();
+applyNight();
+buildScene(seed, +maxH.value);
+document.getElementById("loading").hidden = true;
+(function loop() { if (needs) { needs = false; renderer.render(scene, camera); } requestAnimationFrame(loop); })();
+</script>

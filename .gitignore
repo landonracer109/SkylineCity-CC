@@ -1,0 +1,6 @@
+jobs/
+jobs-*/
+simfleet/
+simfs/
+simsupply/
+*.png

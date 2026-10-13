@@ -1,0 +1,274 @@
+-- citysupply: keeps every Skyline City turtle's Ender Chest stocked from AE. ComputerCraft 1.63
+-- computer at home, joined by wired modems to the ME Interfaces and to the home Ender Chests that sit
+-- against them (one chest per turtle, up to 5 round an interface; the interface's 6th side is its
+-- cable). Every turtle tells the city job server which blocks its next ~640 placements need; this
+-- puts exactly those (and a stack of coal blocks) in its chest and sends everything else back to AE.
+--
+-- Usage
+--   citysupply [server]     run (from startup)
+--   citysupply map          forget which chest touches which interface and work it out again
+--
+-- Pairing chests with turtles is by Ender Chest colours: each turtle reports the colours of the
+-- chest it carries, and the home chest with the same colours is its. A turtle with no matching home
+-- chest gets a spare one: I set that chest's colours to the turtle's. (So: one home chest per turtle,
+-- any colours, all public chests.)
+
+local args = { ... }
+local VERSION = "v1.00"
+local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
+local EVERY = 30            -- seconds between rounds
+local COAL = "173:0"        -- coal blocks, the turtles' fuel
+local COAL_KEEP = 64
+local MIN_SEND = 16         -- don't bother topping up less than this (unless the chest has none)
+local MAP_FILE, CFG_FILE = "citysupply.map", "citysupply.cfg"
+local DIRS = { "north", "south", "east", "west", "up", "down" }
+local OPP = { north = "south", south = "north", east = "west", west = "east", up = "down", down = "up" }
+
+local function readFile(name)
+  local h = fs.open(name, "r")
+  if not h then return nil end
+  local s = h.readAll(); h.close()
+  return s
+end
+local function writeFile(name, s) local h = fs.open(name, "w"); h.write(s); h.close() end
+
+local function say(msg)
+  print(msg)
+  if fs.exists("supply.log") and fs.getSize("supply.log") > 16000 then
+    local keep = readFile("supply.log"):sub(-8000)
+    writeFile("supply.log", keep)
+  end
+  local h = fs.open("supply.log", "a")
+  if h then h.writeLine(string.format("[day %d %s] %s", os.day(), textutils.formatTime(os.time(), true), msg)); h.close() end
+end
+
+local cfg = textutils.unserialize(readFile(CFG_FILE) or "") or {}
+if args[1] and args[1] ~= "map" then cfg.server = args[1]:gsub("/$", ""); writeFile(CFG_FILE, textutils.serialize(cfg)) end
+local SERVER = cfg.server or DEFAULT_SERVER
+
+---------------------------------------------------------------------------------------------------
+-- peripherals
+
+local function try(p, fn, ...)
+  local ok, a = pcall(p[fn], ...)
+  if ok then return a end
+  return nil
+end
+
+local function stacksOf(p)
+  local all = try(p, "getAllStacks")
+  if type(all) ~= "table" then return {} end
+  if all[0] == nil then return all end
+  local s = {}
+  for k, v in pairs(all) do s[k + 1] = v end
+  return s
+end
+
+local ifaces, chests = {}, {}    -- name -> peripheral
+local function find()
+  ifaces, chests = {}, {}
+  for _, name in ipairs(peripheral.getNames()) do
+    local has = {}
+    for _, m in ipairs(peripheral.getMethods(name) or {}) do has[m] = true end
+    local kind = (name .. " " .. (peripheral.getType(name) or "")):lower()
+    if has.extractItem and has.countOfItemType and not kind:find("drive") then ifaces[name] = peripheral.wrap(name) end
+    if has.getFrequency and has.getAllStacks and has.pushItem then chests[name] = peripheral.wrap(name) end
+  end
+end
+
+---------------------------------------------------------------------------------------------------
+-- which chest touches which interface, on which side: found by sending one item out of each side
+-- of each interface and seeing which chest it lands in (then sending it back)
+
+local map = textutils.unserialize(readFile(MAP_FILE) or "") or {}   -- chest name -> { iface, dir, back }
+
+local function countIn(p, id, dmg)
+  local n = 0
+  for _, st in pairs(stacksOf(p)) do
+    if type(st) == "table" and st.id == id and st.dmg == dmg then n = n + (st.qty or 0) end
+  end
+  return n
+end
+
+local function buildMap()
+  -- the probe: any item AE has plenty of
+  local probe
+  for _, ae in pairs(ifaces) do
+    local all = try(ae, "getAvailableItems")
+    if type(all) == "table" then
+      for _, s in pairs(all) do
+        if type(s) == "table" and (tonumber(s.qty) or 0) >= 64 and (s.maxSize or 64) > 1 then probe = s; break end
+      end
+    end
+    if probe then break end
+  end
+  if not probe then say("Can't work out the chests: AE has nothing to test with."); return end
+  say("Working out which chest touches which interface...")
+  local unmapped = {}
+  for name in pairs(chests) do if not map[name] then unmapped[name] = true end end
+  for iname, ae in pairs(ifaces) do
+    for _, dir in ipairs(DIRS) do
+      if not next(unmapped) then break end
+      local before = {}
+      for name in pairs(unmapped) do before[name] = countIn(chests[name], probe.id, probe.dmg) end
+      local got = tonumber(try(ae, "extractItem", { id = probe.id, dmg = probe.dmg, qty = 1 }, dir)) or 0
+      if got > 0 then
+        for name in pairs(unmapped) do
+          if countIn(chests[name], probe.id, probe.dmg) > before[name] then
+            map[name] = { iface = iname, dir = dir, back = OPP[dir] }
+            unmapped[name] = nil
+            -- and back it goes
+            for slot, st in pairs(stacksOf(chests[name])) do
+              if type(st) == "table" and st.id == probe.id and st.dmg == probe.dmg then try(chests[name], "pushItem", OPP[dir], slot, 1); break end
+            end
+            break
+          end
+        end
+      end
+    end
+  end
+  writeFile(MAP_FILE, textutils.serialize(map))
+  local n, left = 0, {}
+  for _ in pairs(map) do n = n + 1 end
+  for name in pairs(unmapped) do left[#left + 1] = name end
+  say(string.format("%d chests next to interfaces.%s", n, #left > 0 and (" Not touching any interface: " .. table.concat(left, ", ")) or ""))
+end
+
+---------------------------------------------------------------------------------------------------
+-- the job server
+
+local function needs()
+  local ok, r = pcall(http.get, SERVER .. "/needs")
+  if not ok or not r then return nil end
+  local t = {}
+  for line in r.readAll():gmatch("[^\n]+") do
+    local label, a, b = line:match("^(%S+) (%S+) (%S+)$")
+    if label then
+      t[label] = t[label] or { want = {} }
+      if a == "chest" then t[label].freq = tonumber(b) else t[label].want[a] = tonumber(b) end
+    end
+  end
+  r.close()
+  return t
+end
+
+local function report(msg)
+  pcall(function()
+    local r = http.post(SERVER .. "/report?t=supply", "phase supply\nversion " .. VERSION .. "\nmsg " .. msg .. "\n")
+    if r then r.close() end
+  end)
+end
+
+---------------------------------------------------------------------------------------------------
+-- stocking
+
+-- n of an item from AE into the chest, one stack per call (a bigger request can overfill a slot and
+-- the chest throws the extra away). Returns how many moved.
+local function send(ae, dir, id, dmg, n)
+  local moved = 0
+  while moved < n do
+    local ask = math.min(64, n - moved)
+    local got = tonumber(try(ae, "extractItem", { id = id, dmg = dmg, qty = ask }, dir)) or 0
+    moved = moved + math.max(0, got)
+    if got < ask then break end
+  end
+  return moved
+end
+
+local short = {}    -- "id:dmg" -> true when AE ran out this round
+
+local function stock(label, chest, m, want)
+  local ae = ifaces[m.iface]
+  if not ae then return "its interface is gone" end
+  want = want or {}
+  want[COAL] = COAL_KEEP
+  -- what's in the chest; anything not wanted (or well over) goes back to AE
+  local have = {}
+  for slot, st in pairs(stacksOf(chest)) do
+    if type(st) == "table" and st.id then
+      local key = st.id .. ":" .. st.dmg
+      local w = want[key]
+      if not w or (have[key] or 0) >= w + 64 then
+        try(chest, "pushItem", m.back, slot, st.qty)
+      else
+        have[key] = (have[key] or 0) + (st.qty or 0)
+      end
+    end
+  end
+  local missing = {}
+  for key, w in pairs(want) do
+    local need = w - (have[key] or 0)
+    if need >= MIN_SEND or (need > 0 and (have[key] or 0) == 0) then
+      local id, dmg = key:match("^(%d+):(%d+)$")
+      local moved = send(ae, m.dir, tonumber(id), tonumber(dmg), need)
+      if moved < need then short[key] = true; missing[#missing + 1] = key end
+    end
+  end
+  return #missing > 0 and ("AE is short of " .. table.concat(missing, ", ")) or "ok"
+end
+
+---------------------------------------------------------------------------------------------------
+-- main
+
+find()
+local nI, nC = 0, 0
+for _ in pairs(ifaces) do nI = nI + 1 end
+for _ in pairs(chests) do nC = nC + 1 end
+say(string.format("citysupply %s: %d ME Interfaces, %d Ender Chests, server %s", VERSION, nI, nC, SERVER))
+if nI == 0 or nC == 0 then say("I need wired modems on the ME Interfaces and on the Ender Chests."); return end
+if args[1] == "map" then map = {} end
+local missingMap = false
+for name in pairs(chests) do if not map[name] then missingMap = true end end
+if missingMap then buildMap() end
+if not fs.exists("startup") then writeFile("startup", 'shell.run("citysupply")\n') end
+
+local lastNote = ""
+while true do
+  local t = needs()
+  if not t then
+    say("Can't reach the job server.")
+  else
+    short = {}
+    -- the home chest of each turtle, by colours
+    local byFreq, taken = {}, {}
+    for name, c in pairs(chests) do
+      if map[name] then
+        local f = tonumber(try(c, "getFrequency"))
+        if f then byFreq[f] = name end
+      end
+    end
+    for label, e in pairs(t) do if e.freq and byFreq[e.freq] then taken[byFreq[e.freq]] = label end end
+    local notes = {}
+    for label, e in pairs(t) do
+      if e.freq and not byFreq[e.freq] then
+        -- a spare home chest takes this turtle's colours
+        for name in pairs(chests) do
+          if map[name] and not taken[name] then
+            local f = tonumber(try(chests[name], "getFrequency"))
+            local mine = false
+            for _, e2 in pairs(t) do if e2.freq == f then mine = true end end
+            if not mine and try(chests[name], "setFrequency", e.freq) ~= false then
+              if tonumber(try(chests[name], "getFrequency")) == e.freq then
+                say(string.format("Home chest %s now has %s's colours (%d).", name, label, e.freq))
+                byFreq[e.freq], taken[name] = name, label
+                break
+              end
+            end
+          end
+        end
+        if not byFreq[e.freq] then notes[#notes + 1] = label .. " has no home chest" end
+      end
+    end
+    for label, e in pairs(t) do
+      local name = e.freq and byFreq[e.freq]
+      if name then
+        local r = stock(label, chests[name], map[name], e.want)
+        if r ~= "ok" then notes[#notes + 1] = label .. ": " .. r end
+      end
+    end
+    local note = #notes > 0 and table.concat(notes, "; ") or "all chests stocked"
+    if note ~= lastNote then say(note); lastNote = note end
+    report(note)
+  end
+  sleep(EVERY)
+end

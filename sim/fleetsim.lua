@@ -1,0 +1,383 @@
+-- Simulates a fleet of CC 1.63 turtles running cityfleet against the real job server (citysrv.py).
+--   SERVER=http://127.0.0.1:8097/city luajit fleetsim.lua <jobs dir> <turtles> [restarts] [seed] [hours]
+-- One shared world: water below the platform, nothing else. Turtles block each other (a move into
+-- another turtle fails, and it shows up as a "turtle" peripheral). Each turtle has its own
+-- 27-slot Ender Chest that "AE" refills every 5 s with 2 stacks of each block of the turtle's
+-- current build file plus coal blocks. The whole server restarts now and then: every turtle's
+-- program is killed (sometimes just after a move whose answer never arrived) and started again
+-- from startup. At the end every block of every job is checked.
+
+local JOBS, N, RESTARTS, SEED, HOURS = arg[1], tonumber(arg[2] or 4), tonumber(arg[3] or 3), tonumber(arg[4] or 1), tonumber(arg[5] or 30)
+local SERVER = os.getenv("SERVER") or "http://127.0.0.1:8097/city"
+local KEY = os.getenv("CITY_KEY") or ""
+local ONLY = os.getenv("ONLY")      -- e.g. "g" = only jobs whose id starts with g count for "finished"
+math.randomseed(SEED)
+local DIR = os.getenv("SIMDIR") or "simfleet"
+os.execute('rm -rf "' .. DIR .. '"; mkdir -p "' .. DIR .. '"')
+
+-- ---------- http through curl ----------
+local function curl(args)
+  local p = io.popen("curl -s -m 30 " .. args)
+  local s = p:read("*a"); p:close()
+  return s
+end
+local function reset()
+  local f = io.open(DIR .. "/body", "wb"); f:write(os.getenv("PREDONE") or ""); f:close()
+  assert(curl(string.format('-X POST -H "X-Key: %s" --data-binary @%s/body %s/reset', KEY, DIR, SERVER)):match("ok"), "server reset failed")
+end
+reset()
+
+-- ---------- what should be built (every job file) ----------
+local function readPlan(file)
+  local p = { mats = {}, cells = {} }
+  local y, at = 0, nil
+  for line in io.lines(file) do
+    local a, b, c = line:match("^(%-?%d+) (%-?%d+) (%d+)$")
+    if a then p.cells[#p.cells + 1] = { tonumber(a) + at[1], y + at[2], tonumber(b) + at[3], tonumber(c) }
+    else
+      local cmd, rest = line:match("^(%S+)%s*(.*)$")
+      if cmd == "L" then y = tonumber(rest)
+      elseif cmd == "at" then local x, yy, z = rest:match("(%-?%d+) (%-?%d+) (%-?%d+)"); at = { tonumber(x), tonumber(yy), tonumber(z) }
+      elseif cmd == "job" then p.id = rest:match("^(%S+)")
+      elseif cmd == "mat" then local n, id, dmg, name = rest:match("^(%d+) (%d+) (%d+) (.*)$"); p.mats[tonumber(n)] = { id = tonumber(id), dmg = tonumber(dmg), name = name } end
+    end
+  end
+  return p
+end
+local expected = {}
+do
+  local p = io.popen('ls "' .. JOBS .. '"')
+  for f in p:lines() do
+    if f:match("%.txt$") and f ~= "water.txt" and (not ONLY or f:sub(1, #ONLY) == ONLY) then expected[#expected + 1] = readPlan(JOBS .. "/" .. f) end
+  end
+  p:close()
+end
+
+-- ---------- the world ----------
+local world, turtleAt = {}, {}
+local function key(x, y, z) return x .. "," .. y .. "," .. z end
+local ENDER, COALB = 801, 173
+local predone = {}
+for id in (os.getenv("PREDONE") or ""):gmatch("%S+") do predone[id] = true end
+for _, p in ipairs(expected) do if predone[p.id] then for _, c in ipairs(p.cells) do local m = p.mats[c[4]]; world[key(c[1], c[2], c[3])] = { id = m.id, dmg = m.dmg } end end end
+local function at(x, y, z) return world[key(x, y, z)] end
+
+local clock = 0            -- the scheduler's time (the earliest turtle's)
+local restartTimes = {}
+for i = 1, RESTARTS do restartTimes[i] = math.random(600, HOURS * 3600 * 0.6) end
+table.sort(restartTimes)
+local stats = { moves = 0, turns = 0, places = 0, digs = 0, perCalls = 0, restocks = 0, restarts = 0, waitsTurtle = 0, http = 0, lostMoves = 0, coal = 0 }
+
+-- ---------- turtles ----------
+local DX = { [0] = 1, 0, -1, 0 }
+local DZ = { [0] = 0, 1, 0, -1 }
+local turtles = {}
+local DEPOT_X0, DEPOT_STEP, DEPOT_Z, GROUND = -858, 8, -200, 63
+
+local function stackTable(st, names) return st and { id = st.id, dmg = st.dmg, qty = st.qty, name = "x", rawName = "x" } or nil end
+
+local function makeTurtle(n)
+  local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * (n - 1), y = GROUND, z = DEPOT_Z, f = 3, fuel = 2500, sel = 1, inv = {},
+    clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
+  T.inv[16] = { id = ENDER, dmg = n, qty = 1 }
+  os.execute('mkdir -p "' .. T.dir .. '"')
+  turtleAt[key(T.x, T.y, T.z)] = T
+  turtles[n] = T
+  return T
+end
+
+local function act(T, dt)
+  T.clock = T.clock + dt
+  coroutine.yield()
+end
+
+-- a server restart reached this turtle: true = kill it now
+local function restartDue(T)
+  local nxt = restartTimes[T.restartIdx + 1]
+  if nxt and T.clock >= nxt then T.restartIdx = T.restartIdx + 1; return true end
+  return false
+end
+
+local function chestAbove(T) local b = at(T.x, T.y + 1, T.z); return b and b.id == ENDER and b.dmg == T.n end
+
+-- AE: keeps 2 stacks of each block in the turtle's current build file, and a stack of coal blocks
+local function aeFill(T)
+  local h = io.open(T.dir .. "/fleet.plan", "rb")
+  local stamp = h and h:read(400) or ""
+  if h then h:close() end
+  if stamp ~= T.planStamp then
+    T.planStamp, T.planMats = stamp, {}
+    if stamp ~= "" then for line in io.lines(T.dir .. "/fleet.plan") do local id, dmg = line:match("^mat %d+ (%d+) (%d+)"); if id then T.planMats[#T.planMats + 1] = { tonumber(id), tonumber(dmg) } end; if line:match("^L ") then break end end end
+  end
+  local inv = T.chest
+  local want = { [COALB .. ":0"] = 64 }
+  for _, m in ipairs(T.planMats) do want[m[1] .. ":" .. m[2]] = 128 end
+  for s = 1, 27 do local st = inv[s]; if st and not want[st.id .. ":" .. st.dmg] then inv[s] = nil end end
+  for k, n in pairs(want) do
+    local id, dmg = k:match("(%d+):(%d+)"); id, dmg = tonumber(id), tonumber(dmg)
+    local have = 0
+    for s = 1, 27 do local st = inv[s]; if st and st.id == id and st.dmg == dmg then have = have + st.qty end end
+    n = n - have
+    for s = 1, 27 do if n <= 0 then break end; local st = inv[s]; if st and st.id == id and st.dmg == dmg and st.qty < 64 then local k2 = math.min(n, 64 - st.qty); st.qty = st.qty + k2; n = n - k2 end end
+    for s = 1, 27 do if n <= 0 then break end; if not inv[s] then local k2 = math.min(n, 64); inv[s] = { id = id, dmg = dmg, qty = k2 }; n = n - k2 end end
+  end
+end
+
+local function envFor(T)
+  local E = setmetatable({}, { __index = _G })
+  local function target(dir)
+    if dir == "up" then return T.x, T.y + 1, T.z elseif dir == "down" then return T.x, T.y - 1, T.z end
+    return T.x + DX[T.f], T.y, T.z + DZ[T.f]
+  end
+  local function store(id, dmg, qty)
+    for i = 0, 15 do
+      local s = (T.sel - 1 + i) % 16 + 1
+      local st = T.inv[s]
+      if st and st.id == id and st.dmg == dmg and st.qty < 64 then local k = math.min(qty, 64 - st.qty); st.qty = st.qty + k; qty = qty - k end
+      if not st and qty > 0 then T.inv[s] = { id = id, dmg = dmg, qty = math.min(qty, 64) }; qty = qty - math.min(qty, 64) end
+      if qty <= 0 then return end
+    end
+  end
+  local function move(dir)
+    local kill = restartDue(T)
+    if kill and math.random() < .5 then coroutine.yield("KILL") end
+    act(T, .4)
+    local x, y, z = target(dir)
+    if at(x, y, z) or turtleAt[key(x, y, z)] then
+      if turtleAt[key(x, y, z)] then stats.waitsTurtle = stats.waitsTurtle + 1 end
+      if kill then coroutine.yield("KILL") end
+      return false
+    end
+    if T.fuel <= 0 then return false end
+    turtleAt[key(T.x, T.y, T.z)] = nil
+    T.fuel = T.fuel - 1; T.x, T.y, T.z = x, y, z; stats.moves = stats.moves + 1
+    turtleAt[key(x, y, z)] = T
+    if kill then stats.lostMoves = stats.lostMoves + 1; coroutine.yield("KILL") end   -- moved, but the answer is lost
+    return true
+  end
+  local function simple(dt) if restartDue(T) then coroutine.yield("KILL") end; act(T, dt) end
+  local function detect(dir) simple(.05); local x, y, z = target(dir); return at(x, y, z) ~= nil or turtleAt[key(x, y, z)] ~= nil end
+  local function dig(dir)
+    simple(.4)
+    local x, y, z = target(dir)
+    local b = world[key(x, y, z)]
+    if not b then return false end
+    world[key(x, y, z)] = nil; stats.digs = stats.digs + 1
+    store(b.id, b.dmg, 1)
+    return true
+  end
+  local function place(dir)
+    simple(.05)
+    local x, y, z = target(dir)
+    local st = T.inv[T.sel]
+    if not st then return false end
+    if at(x, y, z) or turtleAt[key(x, y, z)] then return false end
+    world[key(x, y, z)] = { id = st.id, dmg = st.dmg }
+    st.qty = st.qty - 1; if st.qty == 0 then T.inv[T.sel] = nil end
+    if st.id ~= ENDER then stats.places = stats.places + 1 end
+    return true
+  end
+  local function compare(dir)
+    simple(.05)
+    local x, y, z = target(dir)
+    local b, st = at(x, y, z), T.inv[T.sel]
+    if not b or not st then return (not b) and (not st) end
+    return b.id == st.id and b.dmg == st.dmg
+  end
+  E.turtle = {
+    forward = function() return move("forward") end, up = function() return move("up") end, down = function() return move("down") end,
+    turnLeft = function() simple(.4); T.f = (T.f + 3) % 4; stats.turns = stats.turns + 1; return true end,
+    turnRight = function() simple(.4); T.f = (T.f + 1) % 4; stats.turns = stats.turns + 1; return true end,
+    detect = function() return detect("forward") end, detectUp = function() return detect("up") end, detectDown = function() return detect("down") end,
+    dig = function() return dig("forward") end, digUp = function() return dig("up") end, digDown = function() return dig("down") end,
+    place = function() return place("forward") end, placeUp = function() return place("up") end, placeDown = function() return place("down") end,
+    compare = function() return compare("forward") end, compareUp = function() return compare("up") end, compareDown = function() return compare("down") end,
+    attack = function() simple(.05); return false end, attackUp = function() simple(.05); return false end, attackDown = function() simple(.05); return false end,
+    select = function(s) assert(s >= 1 and s <= 16, "bad slot " .. tostring(s)); T.sel = s; return true end,
+    transferTo = function(to, n)
+      simple(.05)
+      local a, b = T.inv[T.sel], T.inv[to]
+      if not a then return false end
+      if b and (b.id ~= a.id or b.dmg ~= a.dmg) then return false end
+      local k = math.min(n or a.qty, a.qty, 64 - (b and b.qty or 0))
+      if b then b.qty = b.qty + k else T.inv[to] = { id = a.id, dmg = a.dmg, qty = k } end
+      a.qty = a.qty - k; if a.qty == 0 then T.inv[T.sel] = nil end
+      return true
+    end,
+    getItemCount = function(s) local st = T.inv[s or T.sel]; return st and st.qty or 0 end,
+    getFuelLevel = function() return T.fuel end, getFuelLimit = function() return 20000 end,
+    refuel = function(n)
+      local st = T.inv[T.sel]
+      if not st or st.id ~= COALB then return false end
+      if n == 0 then return true end
+      n = math.min(n or st.qty, st.qty)
+      T.fuel = math.min(20000, T.fuel + 720 * n); stats.coal = stats.coal + n; st.qty = st.qty - n; if st.qty == 0 then T.inv[T.sel] = nil end
+      return true
+    end,
+    dropUp = function()
+      simple(.05)
+      local st = T.inv[T.sel]; if not st then return false end
+      if chestAbove(T) then
+        local inv = T.chest
+        for s = 1, 27 do local c = inv[s]; if c and c.id == st.id and c.dmg == st.dmg and c.qty < 64 then local k = math.min(st.qty, 64 - c.qty); c.qty = c.qty + k; st.qty = st.qty - k end end
+        for s = 1, 27 do if st.qty > 0 and not inv[s] then inv[s] = { id = st.id, dmg = st.dmg, qty = st.qty }; st.qty = 0 end end
+        if st.qty == 0 then T.inv[T.sel] = nil end
+        return true
+      end
+      T.inv[T.sel] = nil; return true
+    end,
+  }
+  local selfP = {
+    getAllStacks = function() stats.perCalls = stats.perCalls + 1; act(T, .05); local t = {}; for s = 1, 16 do t[s] = stackTable(T.inv[s]) end; return t end,
+    getStackInSlot = function(s) stats.perCalls = stats.perCalls + 1; act(T, .05); return stackTable(T.inv[s]) end,
+  }
+  local chestP = {
+    getAllStacks = function() stats.perCalls = stats.perCalls + 1; act(T, .05); local t = {}; for s = 1, 27 do t[s] = stackTable(T.chest[s]) end; return t end,
+    pushItem = function(dir, cs, n, ts)
+      stats.perCalls = stats.perCalls + 1; act(T, .05)
+      assert(dir == "down" and ts >= 1 and ts <= 16)
+      local c, t = T.chest[cs], T.inv[ts]
+      if not c then return 0 end
+      if t and (t.id ~= c.id or t.dmg ~= c.dmg) then return 0 end
+      local k = math.min(n or 64, c.qty, 64 - (t and t.qty or 0))
+      if k <= 0 then return 0 end
+      c.qty = c.qty - k; if c.qty == 0 then T.chest[cs] = nil end
+      if t then t.qty = t.qty + k else T.inv[ts] = { id = c.id, dmg = c.dmg, qty = k } end
+      return k
+    end,
+  }
+  E.peripheral = {
+    getMethods = function(side)
+      if side == "left" then return { "getAllStacks", "getStackInSlot" } end
+      if side == "top" and chestAbove(T) then return { "getAllStacks", "pushItem" } end
+      return nil
+    end,
+    wrap = function(side)
+      if side == "left" then return selfP end
+      if side == "top" and chestAbove(T) then stats.restocks = stats.restocks + 1; return chestP end
+      return nil
+    end,
+    getType = function(side)
+      local x, y, z = target(side == "top" and "up" or side == "bottom" and "down" or "forward")
+      if turtleAt[key(x, y, z)] then return "turtle" end
+      local b = at(x, y, z)
+      if b and b.id == ENDER then return "ender_chest" end
+      return nil
+    end,
+  }
+  local function path(p) return T.dir .. "/" .. p end
+  E.fs = {
+    exists = function(p) local h = io.open(path(p), "r"); if h then h:close(); return true end; return false end,
+    delete = function(p) os.remove(path(p)) end,
+    getSize = function(p) local h = io.open(path(p), "rb"); if not h then return 0 end; local n = h:seek("end"); h:close(); return n end,
+    open = function(p, mode)
+      if mode == "a" then return { writeLine = function(s) local h = io.open(path(p), "ab"); h:write(s, "\n"); h:close() end, close = function() end } end
+      if mode == "w" then
+        local buf = {}
+        return { write = function(s) buf[#buf + 1] = s end, close = function() local h = io.open(path(p), "wb"); h:write(table.concat(buf)); h:close() end }
+      end
+      local h = io.open(path(p), "rb"); if not h then return nil end
+      return { readLine = function() return h:read("*l") end, readAll = function() return h:read("*a") end, close = function() h:close() end }
+    end,
+  }
+  local function resp(s) if not s or s == "" then return nil end; stats.http = stats.http + 1; return { readAll = function() return s end, close = function() end } end
+  E.http = {
+    get = function(url) simple(.1); return resp(curl('"' .. url .. '"')) end,
+    post = function(url, body)
+      simple(.1)
+      local f = io.open(T.dir .. "/.post", "wb"); f:write(body); f:close()
+      return resp(curl('--data-binary @"' .. T.dir .. '/.post" "' .. url .. '"'))
+    end,
+  }
+  E.sleep = function(n) if restartDue(T) then coroutine.yield("KILL") end; act(T, n) end
+  E.read = function() return "" end
+  E.os = setmetatable({ day = function() return 1 end, time = function() return 12 end, clock = function() return T.clock - T.boot end,
+    setComputerLabel = function() end }, { __index = os })
+  E.textutils = textutils
+  E.print = function(s)
+    s = tostring(s)
+    T.log[#T.log + 1] = string.format("%8.0fs  %s", T.clock, s)
+    if s:find("Nothing left to build") then T.finished = true end
+  end
+  E.shell = { run = function() end }
+  return E
+end
+
+-- textutils (shared)
+local function ser(v)
+  local t = type(v)
+  if t == "table" then local parts = {}; for k, x in pairs(v) do parts[#parts + 1] = "[" .. ser(k) .. "]=" .. ser(x) end; return "{" .. table.concat(parts, ",") .. "}" end
+  if t == "string" then return string.format("%q", v) end
+  return tostring(v)
+end
+textutils = { formatTime = function() return "12:00" end, serialize = ser, unserialize = function(s) local f = loadstring("return " .. s); if not f then return nil end; local ok, v = pcall(f); return ok and v or nil end }
+
+local prog = assert(loadfile("cityfleet"))
+local function start(T, runArgs)
+  local f = assert(loadfile("cityfleet"))
+  setfenv(f, envFor(T))
+  T.boot = T.clock
+  T.co = coroutine.create(function() return f(unpack(runArgs)) end)
+end
+
+for n = 1, N do start(makeTurtle(n), { tostring(n), SERVER, "go" }) end
+
+-- ---------- run ----------
+local lastAE, lastShow, deadline = -1e9, 0, HOURS * 3600
+local stuckSince = {}
+local ended = "time limit"
+while true do
+  local T
+  for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end
+  if not T then ended = "every turtle stopped"; break end
+  clock = T.clock
+  if clock - lastAE >= 5 then lastAE = clock; for _, t in ipairs(turtles) do aeFill(t) end end
+  if clock > deadline then break end
+  local done = true
+  for _, t in ipairs(turtles) do if not t.finished then done = false end end
+  if done then ended = "all turtles home, nothing left"; break end
+  if clock - lastShow > 1800 then
+    lastShow = clock
+    io.stderr:write(string.format("%5.1f h  placed %d  waits for turtles %d  http %d\n", clock / 3600, stats.places, stats.waitsTurtle, stats.http))
+  end
+  local ok, sig = coroutine.resume(T.co)
+  if not ok then
+    T.log[#T.log + 1] = string.format("%8.0fs  CRASH %s", T.clock, tostring(sig))
+    io.stderr:write("turtle " .. T.n .. " crashed: " .. tostring(sig) .. "\n")
+    T.co = nil
+  elseif sig == "KILL" then
+    stats.restarts = stats.restarts + 1
+    T.log[#T.log + 1] = string.format("%8.0fs  -- server restart --", T.clock)
+    T.clock = T.clock + 30
+    start(T, {})
+  elseif coroutine.status(T.co) == "dead" then
+    T.log[#T.log + 1] = string.format("%8.0fs  program ended", T.clock)
+    T.co = nil
+  end
+end
+
+-- ---------- check ----------
+local want, missing, wrong, extra, total = {}, 0, 0, 0, 0
+local missingBy = {}
+for _, p in ipairs(expected) do
+  for _, c in ipairs(p.cells) do
+    total = total + 1
+    local k = key(c[1], c[2], c[3]); want[k] = true
+    local b, m = world[k], p.mats[c[4]]
+    if not b then missing = missing + 1; missingBy[p.id] = (missingBy[p.id] or 0) + 1
+    elseif b.id ~= m.id or b.dmg ~= m.dmg then wrong = wrong + 1; if wrong <= 5 then io.write("  wrong at ", k, " have ", b.id, ":", b.dmg, " want ", m.id, ":", m.dmg, " (", p.id, ")\n") end end
+  end
+end
+for k, b in pairs(world) do if not want[k] then extra = extra + 1; if extra <= 5 then io.write("  extra block ", k, " id ", b.id, ":", b.dmg, "\n") end end end
+for _, T in ipairs(turtles) do
+  io.write(string.format("\n== turtle %d at %d,%d,%d facing %d, fuel %d, clock %.1f h ==\n", T.n, T.x, T.y, T.z, T.f, T.fuel, T.clock / 3600))
+  local from = tonumber(os.getenv("LOGLINES") or 12)
+  for i = math.max(1, #T.log - from + 1), #T.log do io.write(T.log[i], "\n") end
+end
+local mb = {}
+for id, n in pairs(missingBy) do mb[#mb + 1] = id .. ":" .. n end
+table.sort(mb)
+io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
+if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
+io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
+  stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))

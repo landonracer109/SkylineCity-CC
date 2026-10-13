@@ -1,0 +1,501 @@
+-- citybuild: builds one Skyline City building from a build file. ComputerCraft 1.63 turtle with a
+-- Narcissistic upgrade (OpenPeripherals Addons, reads the turtle's own inventory) and a diamond
+-- pickaxe (clears grass, leaves and other stray blocks in its way). Ender Chest in slot 16.
+--
+-- Usage
+--   citybuild <url or file>   starts a building: fetches its build file, then tells you where to put me
+--   citybuild <url or file> go   the same, without waiting for Enter (for starting turtles remotely)
+--   citybuild                 carries on after a restart (runs from startup by itself)
+--   citybuild status          how far along the build is
+--
+-- Put me on the ground one block west and one block north of the building's north-west corner,
+-- facing EAST. The build file's coordinates count from that corner: x east, z south, y up
+-- (0 = the first layer, standing on the ground). I build bottom up, flying one block above each
+-- layer and placing blocks down, and restock from the Ender Chest whenever I run out.
+
+local args = { ... }
+local PLAN_FILE, STATE_FILE = "city.plan", "city.state"
+local CHEST = 16
+local MIN_FUEL = 300
+local WINDOW = 640          -- each restock loads blocks for this many upcoming placements
+
+-- Messages go to the screen and to city.log (the last ~200 lines), so a turtle's trouble can be read
+-- from outside: "type city.log" on it, or from the world's computer folder.
+local function say(msg)
+  print(msg)
+  local line = string.format("[day %d %s] %s", os.day(), textutils.formatTime(os.time(), true), msg)
+  if fs.exists("city.log") and fs.getSize("city.log") > 16000 then
+    local h = fs.open("city.log", "r"); local keep = h.readAll():sub(-8000); h.close()
+    h = fs.open("city.log", "w"); h.write(keep); h.close()
+  end
+  local h = fs.open("city.log", "a")
+  if h then h.writeLine(line); h.close() end
+end
+
+---------------------------------------------------------------------------------------------------
+-- the build file
+
+local plan
+
+local function loadPlan()
+  local h = fs.open(PLAN_FILE, "r")
+  if not h then return nil, "no build file (" .. PLAN_FILE .. ")" end
+  local p = { mats = {}, xs = {}, ys = {}, zs = {}, ms = {} }
+  local y = 0
+  while true do
+    local line = h.readLine()
+    if not line then break end
+    local a, b, c = line:match("^(%-?%d+) (%-?%d+) (%d+)$")
+    if a then
+      local n = #p.xs + 1
+      p.xs[n], p.ys[n], p.zs[n], p.ms[n] = tonumber(a), y, tonumber(b), tonumber(c)
+    else
+      local cmd, rest = line:match("^(%S+)%s*(.*)$")
+      if cmd == "L" then y = tonumber(rest)
+      elseif cmd == "mat" then
+        local n, id, dmg, name = rest:match("^(%d+) (%d+) (%d+) (.*)$")
+        p.mats[tonumber(n)] = { id = tonumber(id), dmg = tonumber(dmg), name = name }
+      elseif cmd == "name" then p.name = rest
+      elseif cmd == "size" then
+        local w, hh, d = rest:match("^(%d+) (%d+) (%d+)")
+        p.w, p.h, p.d = tonumber(w), tonumber(hh), tonumber(d)
+      elseif cmd == "end" then p.complete = true end
+    end
+  end
+  h.close()
+  if not p.complete then return nil, "the build file is cut short (no 'end' line)" end
+  return p
+end
+
+---------------------------------------------------------------------------------------------------
+-- saving
+
+local st, pos   -- st = { cell = next block to place, pos = { x, y, z, f } }
+
+local function save()
+  local h = fs.open(STATE_FILE, "w")
+  h.write(textutils.serialize(st))
+  h.close()
+end
+
+local function loadState()
+  if not fs.exists(STATE_FILE) then return false end
+  local h = fs.open(STATE_FILE, "r")
+  local s = textutils.unserialize(h.readAll())
+  h.close()
+  if type(s) ~= "table" or not s.pos or not s.cell then return false end
+  st, pos = s, s.pos
+  return true
+end
+
+---------------------------------------------------------------------------------------------------
+-- inventory: the Narcissistic upgrade tells us what is in each slot
+
+local self_   -- the upgrade's peripheral
+local slotMat = {}   -- slot -> material number (nil = empty, junk, or fuel)
+local dirty = true   -- re-read the inventory before trusting slotMat
+
+local function findSelf()
+  for _, side in ipairs({ "left", "right" }) do
+    local methods = peripheral.getMethods(side)
+    if methods then
+      for _, m in ipairs(methods) do
+        if m == "getAllStacks" then return peripheral.wrap(side) end
+      end
+    end
+  end
+  return nil
+end
+
+-- OpenPeripherals' stacks by slot number, 1-based
+local function stacksOf(p)
+  local ok, all = pcall(p.getAllStacks)
+  if not ok or type(all) ~= "table" then return {} end
+  if all[0] == nil then return all end
+  local shifted = {}
+  for k, v in pairs(all) do shifted[k + 1] = v end
+  return shifted
+end
+
+local function matOf(stack)
+  if type(stack) ~= "table" or not stack.id then return nil end
+  for n, m in pairs(plan.mats) do
+    if m.id == stack.id and m.dmg == stack.dmg then return n end
+  end
+  return nil
+end
+
+-- The Ender Chest belongs in slot 16. If it ended up anywhere else (dug up after a restart), put it back.
+local function isChest(stack)
+  return type(stack) == "table" and st and st.chest and stack.id == st.chest.id and stack.dmg == st.chest.dmg
+end
+
+local function rescan()
+  local stacks = stacksOf(self_)
+  slotMat = {}
+  for s = 1, 15 do
+    if isChest(stacks[s]) and turtle.getItemCount(CHEST) == 0 then
+      turtle.select(s); turtle.transferTo(CHEST)
+    else
+      slotMat[s] = matOf(stacks[s])
+    end
+  end
+  dirty = false
+end
+
+local function slotFor(m)
+  if dirty then rescan() end
+  for s = 1, 15 do
+    if slotMat[s] == m and turtle.getItemCount(s) > 0 then return s end
+  end
+  return nil
+end
+
+local function fuelLevel()
+  local f = turtle.getFuelLevel()
+  if f == "unlimited" then return math.huge end
+  return f
+end
+
+---------------------------------------------------------------------------------------------------
+-- the Ender Chest
+
+local function placeChest()
+  -- after a restart in the middle of restocking the chest is still above me
+  if turtle.getItemCount(CHEST) == 0 and turtle.detectUp() then
+    local p = peripheral.wrap("top")
+    if p and p.getAllStacks then return p end
+  end
+  turtle.select(CHEST)
+  while not turtle.placeUp() do
+    if turtle.detectUp() and peripheral.getType("top") ~= "turtle" then
+      turtle.digUp(); dirty = true          -- leaves or a stray block: clear it
+    else
+      say(turtle.getItemCount(CHEST) == 0 and "Put the Ender Chest back in slot 16." or "Waiting for room above me for the Ender Chest...")
+      sleep(5)
+    end
+    turtle.select(CHEST)
+  end
+  for _ = 1, 20 do
+    local p = peripheral.wrap("top")
+    if p and p.getAllStacks then return p end
+    sleep(0.1)
+  end
+  error("The Ender Chest above me can't be read. Is OpenPeripherals installed?")
+end
+
+local function pickUpChest()
+  turtle.select(CHEST)
+  turtle.digUp()
+  turtle.select(1)
+  dirty = true
+end
+
+local function freeSlot()
+  for s = 1, 15 do if turtle.getItemCount(s) == 0 then return s end end
+  return nil
+end
+
+-- Burns fuel found in the chest (anything that isn't a building block) until the tank is full.
+local function refuelFrom(chest)
+  local limit = turtle.getFuelLimit and turtle.getFuelLimit() or 20000
+  local notFuel = {}
+  for _ = 1, 30 do
+    if fuelLevel() >= limit - 1000 then return end
+    local slot = freeSlot()
+    if not slot then return end
+    local found = false
+    for cs, stack in pairs(stacksOf(chest)) do
+      local key = type(stack) == "table" and stack.id and (stack.id .. ":" .. stack.dmg)
+      if key and not matOf(stack) and not notFuel[key] then
+        found = true
+        chest.pushItem("down", cs, 64, slot)
+        turtle.select(slot)
+        if turtle.refuel(0) then
+          local before = fuelLevel()
+          turtle.refuel(1)
+          local each = math.max(1, fuelLevel() - before)
+          while turtle.getItemCount(slot) > 0 and fuelLevel() + each <= limit do
+            if not turtle.refuel(1) then break end
+          end
+        else
+          notFuel[key] = true
+        end
+        if turtle.getItemCount(slot) > 0 then turtle.dropUp() end
+        break
+      end
+    end
+    if not found then return end
+  end
+end
+
+-- What the next WINDOW placements need, and the order each material is first needed in.
+local function upcoming()
+  local need, order = {}, {}
+  for i = st.cell, math.min(#plan.xs, st.cell + WINDOW - 1) do
+    local m = plan.ms[i]
+    if not need[m] then need[m] = 0; order[#order + 1] = m end
+    need[m] = need[m] + 1
+  end
+  return need, order
+end
+
+-- Swaps the inventory over to what the next WINDOW placements need, waiting while the block the
+-- next placement needs (`want`) or fuel is missing from the chest.
+local function restock(want)
+  say(string.format("Restocking at block %d (fuel %s)", st.cell, tostring(turtle.getFuelLevel())))
+  local chest = placeChest()
+  while true do
+    local need, order = upcoming()
+    -- how many slots each material gets: enough for its need, first-needed first
+    local slots, used = {}, 0
+    for _, m in ipairs(order) do
+      local k = math.min(math.ceil(need[m] / 64), 15 - used)
+      if k <= 0 then break end
+      slots[m], used = k, used + k
+    end
+    -- give back whatever isn't needed now: other materials, extras, and anything dug up
+    rescan()
+    local keep = {}
+    for s = 1, 15 do
+      local m, n = slotMat[s], turtle.getItemCount(s)
+      if n > 0 then
+        if m and slots[m] and (keep[m] or 0) < slots[m] then
+          keep[m] = (keep[m] or 0) + 1
+        else
+          turtle.select(s)
+          turtle.dropUp()
+          if turtle.getItemCount(s) > 0 then say("The Ender Chest is full; can't hand back slot " .. s .. ".") end
+        end
+      end
+    end
+    rescan()
+    -- fill up from the chest
+    local stacks = stacksOf(chest)
+    for _, m in ipairs(order) do
+      if slots[m] then
+        local target = math.min(need[m], slots[m] * 64)
+        local have = 0
+        for s = 1, 15 do if slotMat[s] == m then have = have + turtle.getItemCount(s) end end
+        for cs, stack in pairs(stacks) do
+          if have >= target then break end
+          if matOf(stack) == m and (stack.qty or 0) > 0 then
+            -- top up my slots of this material first, then empty ones
+            for s = 1, 15 do
+              if have >= target or (stack.qty or 0) <= 0 then break end
+              local cnt = turtle.getItemCount(s)
+              if (slotMat[s] == m and cnt < 64) or cnt == 0 then
+                local moved = chest.pushItem("down", cs, math.min(64 - cnt, target - have, stack.qty), s) or 0
+                if moved > 0 then slotMat[s] = m end
+                have, stack.qty = have + moved, stack.qty - moved
+              end
+            end
+          end
+        end
+      end
+    end
+    if fuelLevel() < MIN_FUEL * 10 then refuelFrom(chest) end
+    rescan()
+    if (not want or slotFor(want)) and fuelLevel() >= MIN_FUEL then break end
+    say("The Ender Chest needs " .. (want and not slotFor(want) and plan.mats[want].name or "fuel (coal)") .. ". Waiting...")
+    sleep(10)
+  end
+  pickUpChest()
+end
+
+---------------------------------------------------------------------------------------------------
+-- moving (x east, z south; facing 0 = east, 1 = south, 2 = west, 3 = north)
+
+local DX = { [0] = 1, 0, -1, 0 }
+local DZ = { [0] = 0, 1, 0, -1 }
+
+local function turnTo(f)
+  while pos.f ~= f do
+    if (pos.f + 1) % 4 == f then turtle.turnRight(); pos.f = f
+    else turtle.turnLeft(); pos.f = (pos.f + 3) % 4 end
+    save()
+  end
+end
+
+local SIDE = { forward = "front", up = "top", down = "bottom" }
+
+local function step(dir)
+  if fuelLevel() < MIN_FUEL then restock(nil) end
+  local move, detect, dig, attack = turtle.forward, turtle.detect, turtle.dig, turtle.attack
+  if dir == "up" then move, detect, dig, attack = turtle.up, turtle.detectUp, turtle.digUp, turtle.attackUp
+  elseif dir == "down" then move, detect, dig, attack = turtle.down, turtle.detectDown, turtle.digDown, turtle.attackDown end
+  local told = false
+  while not move() do
+    if detect() then
+      if peripheral.getType(SIDE[dir]) == "turtle" then
+        if not told then say("Another turtle is in my way; waiting for it."); told = true end
+        sleep(2)
+      elseif dir == "down" then
+        -- going down only ever happens outside the building or onto my own next layer, so a
+        -- block there is unexpected: don't dig it, ask
+        say(string.format("Something is below me at %d,%d,%d; please clear it.", pos.x, pos.y - 1, pos.z))
+        sleep(5)
+      elseif dir == "up" and turtle.getItemCount(CHEST) == 0 and peripheral.wrap("top") and peripheral.wrap("top").getAllStacks then
+        pickUpChest()          -- my own Ender Chest, left above me by a restart
+      else
+        dig(); dirty = true    -- grass, leaves, a tree, a stray block
+      end
+    elseif not attack() then
+      sleep(0.5)
+    end
+  end
+  if dir == "up" then pos.y = pos.y + 1
+  elseif dir == "down" then pos.y = pos.y - 1
+  else pos.x, pos.z = pos.x + DX[pos.f], pos.z + DZ[pos.f] end
+  save()
+end
+
+local function moveX(x) if pos.x ~= x then turnTo(x > pos.x and 0 or 2) end; while pos.x ~= x do step("forward") end end
+local function moveZ(z) if pos.z ~= z then turnTo(z > pos.z and 1 or 3) end; while pos.z ~= z do step("forward") end end
+local function moveY(y) while pos.y < y do step("up") end; while pos.y > y do step("down") end end
+
+-- Over (x, z) at height y: up first, then across. Everything at or above my height is unbuilt.
+local function goTo(x, y, z)
+  if pos.y < y then moveY(y) end
+  moveX(x); moveZ(z)
+  if pos.y > y then moveY(y) end
+end
+
+---------------------------------------------------------------------------------------------------
+-- placing
+
+local function placeCell(i)
+  local x, y, z, m = plan.xs[i], plan.ys[i], plan.zs[i], plan.ms[i]
+  goTo(x, y + 1, z)
+  for _ = 1, 200 do
+    local s = slotFor(m)
+    if not s then
+      restock(m)
+    else
+      turtle.select(s)
+      if turtle.detectDown() then
+        if turtle.compareDown() then return end          -- already placed (before a restart)
+        turtle.digDown(); dirty = true                    -- grass or a stray block where mine goes
+      elseif turtle.placeDown() then
+        return
+      else
+        turtle.attackDown(); sleep(0.5)                    -- a mob in the way
+      end
+    end
+  end
+  error(string.format("Couldn't place %s at %d,%d,%d.", plan.mats[m].name, x, y, z))
+end
+
+---------------------------------------------------------------------------------------------------
+-- main
+
+local function counts()
+  local c = {}
+  for i = 1, #plan.ms do c[plan.ms[i]] = (c[plan.ms[i]] or 0) + 1 end
+  return c
+end
+
+if args[1] == "status" then
+  local p, err = loadPlan()
+  if not p then print(err); return end
+  plan = p
+  if loadState() then
+    print(string.format("%s: %d of %d blocks placed (%d%%), at layer %d of %d.", plan.name, st.cell - 1, #plan.xs,
+      math.floor((st.cell - 1) * 100 / #plan.xs), plan.ys[math.min(st.cell, #plan.xs)], plan.h))
+  else
+    print(plan.name .. ": not started.")
+  end
+  return
+end
+
+self_ = findSelf()
+if not self_ then
+  print("I need a Narcissistic upgrade (OpenPeripherals Addons) to see my own inventory.")
+  return
+end
+
+local resumed = false
+if args[1] then
+  if fs.exists(STATE_FILE) then
+    print("A build is already under way (" .. STATE_FILE .. "). Delete it to start over.")
+    return
+  end
+  if args[1]:match("^https?://") then
+    local r = http.get(args[1])
+    if not r then print("Couldn't download " .. args[1]); return end
+    local h = fs.open(PLAN_FILE, "w"); h.write(r.readAll()); h.close(); r.close()
+  elseif args[1] ~= PLAN_FILE then
+    if not fs.exists(args[1]) then print("No file " .. args[1]); return end
+    if fs.exists(PLAN_FILE) then fs.delete(PLAN_FILE) end
+    fs.copy(args[1], PLAN_FILE)
+  end
+else
+  resumed = loadState()
+  if not resumed then print("Usage: citybuild <url or file> | citybuild status"); return end
+end
+
+local err
+plan, err = loadPlan()
+if not plan then print(err); return end
+
+if not resumed then
+  local c = counts()
+  print(string.format("%s: %dx%d, %d tall, %d blocks.", plan.name, plan.w, plan.d, plan.h, #plan.xs))
+  for n, m in pairs(plan.mats) do print(string.format("  %6d  %s", c[n] or 0, m.name)) end
+  print("Put me on the ground 1 west and 1 north of the north-west corner, facing EAST,")
+  print("with the Ender Chest in slot 16.")
+  if args[2] ~= "go" then
+    print("Enter to start, Ctrl+T to cancel.")
+    read()
+  end
+  if turtle.getItemCount(CHEST) == 0 then print("No Ender Chest in slot 16."); return end
+  local cs = self_.getStackInSlot(CHEST)
+  st = { cell = 1, pos = { x = -1, y = 0, z = -1, f = 0 }, chest = cs and { id = cs.id, dmg = cs.dmg } }
+  pos = st.pos
+  save()
+end
+-- a restart in the middle of restocking leaves the Ender Chest above me: take it back first
+if turtle.getItemCount(CHEST) == 0 and turtle.detectUp() then
+  local p = peripheral.wrap("top")
+  if p and p.getAllStacks then pickUpChest() end
+end
+rescan()
+if not fs.exists("startup") then
+  local h = fs.open("startup", "w")
+  h.write('shell.run("citybuild")\n')
+  h.close()
+end
+
+local function build()
+  local total = #plan.xs
+  local lastLayer = nil
+  while st.cell <= total do
+    local i = st.cell
+    if plan.ys[i] ~= lastLayer then
+      lastLayer = plan.ys[i]
+      say(string.format("Layer %d of %d (%d%% done)", lastLayer, plan.h - 1, math.floor((i - 1) * 100 / total)))
+    end
+    placeCell(i)
+    st.cell = i + 1
+    save()
+  end
+
+  -- done: hand back what's left, then come down outside the corner where I started
+  restock(nil)
+  goTo(-1, pos.y, -1)
+  moveY(0)
+  turnTo(0)
+  fs.delete(STATE_FILE)
+  local h = fs.open("startup", "r")
+  local s = h and h.readAll()
+  if h then h.close() end
+  if s == 'shell.run("citybuild")\n' then fs.delete("startup") end
+  say(plan.name .. " is built. I'm back where I started.")
+end
+
+local ok, err = pcall(build)
+if not ok then
+  if err == "Terminated" then say("Stopped (Ctrl+T). Run citybuild to carry on."); return end
+  say("ERROR: " .. tostring(err))
+  error(err, 0)
+end

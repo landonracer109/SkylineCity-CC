@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skyline City build</title>
+<style>
+:root {
+  --bg: #f4f2ee; --panel: #ffffff; --ink: #1d2128; --dim: #6b7280; --line: #e2ded6;
+  --done: #3f8f5a; --building: #e0a127; --ready: #4a78c2; --waiting: #c9c4ba; --bad: #c2412d;
+  --road: #2b2f36;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111418; --panel: #1a1e24; --ink: #e8e6e1; --dim: #9aa1ab; --line: #2c323b;
+    --done: #4fae6e; --building: #f0b43c; --ready: #6b98e0; --waiting: #3a4049; --bad: #e0634f; --road: #0b0d10; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 16px; }
+h1 { font-size: 22px; margin: 0; letter-spacing: .2px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+.top .sub { color: var(--dim); }
+.bar { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--done); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 12px; }
+.stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--dim); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+canvas { width: 100%; height: auto; display: block; border-radius: 6px; background: var(--road); }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; color: var(--dim); font-size: 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--dim); font-weight: 600; font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+td { padding: 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.msg { color: var(--dim); font-size: 12px; }
+.late { color: var(--bad); font-weight: 600; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; background: var(--line); }
+.kinds { display: grid; gap: 8px; }
+.kinds .row { display: grid; grid-template-columns: 90px 1fr 120px; gap: 10px; align-items: center; font-size: 13px; }
+.kinds .row span:last-child { color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
+#tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.15); }
+.err { color: var(--bad); }
+.wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <section class="panel">
+    <div class="top"><h1>Skyline City</h1><span class="sub" id="when">loading…</span></div>
+    <div class="bar" style="margin-top:10px"><i id="allbar" style="width:0"></i></div>
+    <div class="stats">
+      <div class="stat"><b id="sPlaced">–</b><span>blocks placed</span></div>
+      <div class="stat"><b id="sJobs">–</b><span>jobs done</span></div>
+      <div class="stat"><b id="sRate">–</b><span>blocks per hour (last 30 min)</span></div>
+      <div class="stat"><b id="sEta">–</b><span>time left at that rate</span></div>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <section class="panel">
+      <h2>Map</h2>
+      <canvas id="map" width="800" height="800"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--done)"></i>built</span>
+        <span><i style="background:var(--building)"></i>being built</span>
+        <span><i style="background:var(--ready)"></i>ready</span>
+        <span><i style="background:var(--waiting)"></i>waiting for others</span>
+        <span><i style="background:#fff;border-radius:50%"></i>turtle</span>
+      </div>
+    </section>
+    <div style="display:grid;gap:16px">
+      <section class="panel">
+        <h2>Turtles</h2>
+        <div class="wrap"><table>
+          <thead><tr><th>Turtle</th><th>Doing</th><th>Progress</th><th>Fuel</th><th>Seen</th></tr></thead>
+          <tbody id="turtles"></tbody>
+        </table></div>
+      </section>
+      <section class="panel">
+        <h2>Supply</h2>
+        <div id="supply" class="msg">no word from the supply computer yet</div>
+      </section>
+      <section class="panel">
+        <h2>By kind</h2>
+        <div class="kinds" id="kinds"></div>
+      </section>
+    </div>
+  </div>
+</main>
+<div id="tip"></div>
+<script>
+const KIND = { ground: "Platform", street: "Streets", tower: "Buildings", park: "Parks", water: "Water" };
+const PHASE = { ask: "between jobs", go: "flying to", build: "building", leave: "leaving", home: "flying home", supply: "supply" };
+const fmt = n => n == null ? "–" : Math.round(n).toLocaleString("en-US");
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let S = null, boxes = [];
+
+function ago(s) { return s < 90 ? s + " s" : s < 5400 ? Math.round(s / 60) + " min" : Math.round(s / 3600) + " h"; }
+function hours(h) { if (h == null || !isFinite(h)) return "–"; const m = Math.round(h * 60); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + (m % 60) + " min"; }
+function niceNeed(s) {   // "AE is short of 22:0, 4095:0" -> names
+  return s.replace(/\b(\d+:\d+)\b/g, k => (S && S.names[k]) || k);
+}
+
+function draw() {
+  const c = document.getElementById("map"), g = c.getContext("2d");
+  const [W, D] = S.span, pad = 6, sc = Math.min((c.width - 2 * pad) / W, (c.height - 2 * pad) / D);
+  c.height = Math.round(D * sc + 2 * pad);
+  g.fillStyle = css("--road"); g.fillRect(0, 0, c.width, c.height);
+  const col = { done: css("--done"), building: css("--building"), ready: css("--ready"), waiting: css("--waiting") };
+  boxes = [];
+  // platform tiles first (under everything), drawn faint; then streets, then buildings
+  const order = { ground: 0, street: 1, water: 1, park: 2, tower: 2 };
+  const jobs = S.jobs.slice().sort((a, b) => order[a[1]] - order[b[1]]);
+  for (const [id, kind, name, [x0, z0, x1, z1], blocks, h, state, placed, who] of jobs) {
+    if (kind === "street" || kind === "water") continue;
+    const X = pad + x0 * sc, Y = pad + z0 * sc, w = (x1 - x0 + 1) * sc, d = (z1 - z0 + 1) * sc;
+    if (kind === "ground") {
+      g.globalAlpha = state === "done" ? .35 : .18; g.fillStyle = col[state]; g.fillRect(X, Y, w, d); g.globalAlpha = 1;
+      continue;
+    }
+    g.fillStyle = col[state]; g.fillRect(X + .5, Y + .5, w - 1, d - 1);
+    if (state === "building" && blocks) {
+      g.fillStyle = col.done; const f = placed / blocks; g.fillRect(X + .5, Y + .5 + (d - 1) * (1 - f), w - 1, (d - 1) * f);
+    }
+    boxes.push({ X, Y, w, d, id, kind, name, blocks, h, state, placed, who });
+  }
+  // turtles
+  for (const [t, r] of Object.entries(S.reports)) {
+    if (t === "supply" || r.x == null) continue;
+    const x = (+r.x - S.origin[0]), z = (+r.z - S.origin[2]);
+    const X = pad + (x + .5) * sc, Y = pad + (z + .5) * sc;
+    g.beginPath(); g.arc(X, Y, 4.5, 0, 7); g.fillStyle = r.age > 180 ? css("--bad") : "#fff"; g.fill();
+    g.lineWidth = 1.5; g.strokeStyle = "#000"; g.stroke();
+    g.font = "11px system-ui"; g.fillStyle = "#fff"; g.fillText(t.replace("city", ""), X + 6, Y - 5);
+  }
+}
+
+function render() {
+  const total = S.jobs.reduce((s, j) => s + j[4], 0);
+  document.getElementById("allbar").style.width = (100 * S.placed / total).toFixed(1) + "%";
+  document.getElementById("sPlaced").textContent = fmt(S.placed) + " / " + fmt(total);
+  document.getElementById("sJobs").textContent = S.doneCount + " / " + S.jobCount;
+  document.getElementById("sRate").textContent = S.rate ? fmt(S.rate) : "–";
+  document.getElementById("sEta").textContent = S.rate ? hours((total - S.placed) / S.rate) : "–";
+  document.getElementById("when").textContent = (100 * S.placed / total).toFixed(1) + "% built · updated " + new Date().toLocaleTimeString();
+  const byId = Object.fromEntries(S.jobs.map(j => [j[0], j]));
+  const rows = Object.entries(S.reports).filter(([t]) => t !== "supply").sort((a, b) => (+a[0].replace(/\D/g, "")) - (+b[0].replace(/\D/g, "")));
+  document.getElementById("turtles").innerHTML = rows.map(([t, r]) => {
+    const j = byId[r.job];
+    const doing = (PHASE[r.phase] || r.phase) + (j && r.phase !== "ask" ? " " + j[2] : "");
+    const prog = j && (r.phase === "build" || r.phase === "go") ? Math.floor(100 * (Math.max(0, r.cell - 1)) / j[4]) + "% of " + fmt(j[4]) : "";
+    const late = r.age > 180;
+    // the "Job ...: flying there" line is old news once it's building
+    const msg = r.phase === "build" && /^Job /.test(r.msg || "") ? "" : (r.msg || "");
+    return `<tr><td><b>${t}</b></td><td>${doing}<div class="msg">${esc(niceNeed(msg))}</div></td>` +
+      `<td class="num">${prog}</td><td class="num">${fmt(+r.fuel)}</td><td class="num ${late ? "late" : ""}">${ago(r.age)}${late ? " ⚠" : ""}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="msg">no turtles have reported yet</td></tr>`;
+  const sup = S.reports.supply;
+  document.getElementById("supply").innerHTML = sup ? `<span class="${sup.age > 180 ? "late" : ""}">${esc(niceNeed(sup.msg || ""))}</span> <span class="msg">· ${ago(sup.age)} ago</span>` : "no word from the supply computer yet";
+  document.getElementById("kinds").innerHTML = ["ground", "street", "tower", "park"].filter(k => S.kinds[k]).map(k => {
+    const e = S.kinds[k], p = e.blocks ? 100 * e.placed / e.blocks : 0;
+    return `<div class="row"><span>${KIND[k]}</span><div class="bar"><i style="width:${p.toFixed(1)}%"></i></div><span>${e.done}/${e.jobs} jobs</span></div>`;
+  }).join("");
+  draw();
+}
+function esc(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function load() {
+  try {
+    const r = await fetch(location.pathname.replace(/\/$/, "") + "/status.json", { cache: "no-store" });
+    S = await r.json();
+    render();
+  } catch (e) {
+    document.getElementById("when").innerHTML = `<span class="err">can't reach the job server (${esc(String(e))})</span>`;
+  }
+}
+const tip = document.getElementById("tip");
+document.getElementById("map").addEventListener("mousemove", ev => {
+  const c = ev.target, r = c.getBoundingClientRect(), k = c.width / r.width;
+  const x = (ev.clientX - r.left) * k, y = (ev.clientY - r.top) * k;
+  const b = boxes.slice().reverse().find(b => x >= b.X && x <= b.X + b.w && y >= b.Y && y <= b.Y + b.d);
+  if (!b) { tip.style.display = "none"; return; }
+  const st = { done: "built", building: "being built by " + b.who, ready: "ready to start", waiting: "waiting for the platform/streets" }[b.state];
+  tip.innerHTML = `<b>${esc(b.name)}</b><br>${b.h} tall, ${fmt(b.blocks)} blocks<br>${st}${b.state === "building" ? ` (${Math.floor(100 * b.placed / b.blocks)}%)` : ""}`;
+  tip.style.display = "block"; tip.style.left = (ev.clientX + 14) + "px"; tip.style.top = (ev.clientY + 14) + "px";
+});
+document.getElementById("map").addEventListener("mouseleave", () => tip.style.display = "none");
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>
