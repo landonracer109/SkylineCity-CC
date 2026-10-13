@@ -14,7 +14,7 @@
 -- any colours. Private chests work and keep other players out: all 32 must be yours.)
 
 local args = { ... }
-local VERSION = "v1.00"
+local VERSION = "v1.01"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local EVERY = 30            -- seconds between rounds
 local COAL = "173:0"        -- coal blocks, the turtles' fuel
@@ -91,18 +91,17 @@ local function countIn(p, id, dmg)
 end
 
 local function buildMap()
-  -- the probe: any item AE has plenty of
+  -- the probe: a common block AE has (counted the way stockkeep does, which works on big networks;
+  -- the full item list can come back empty there)
   local probe
-  for _, ae in pairs(ifaces) do
-    local all = try(ae, "getAvailableItems")
-    if type(all) == "table" then
-      for _, s in pairs(all) do
-        if type(s) == "table" and (tonumber(s.qty) or 0) >= 64 and (s.maxSize or 64) > 1 then probe = s; break end
-      end
-    end
-    if probe then break end
+  local _, ae0 = next(ifaces)
+  local seen = {}
+  for _, c in ipairs({ { 173, 0, "coal blocks" }, { 1, 0, "stone" }, { 4, 0, "cobblestone" }, { 20, 0, "glass" }, { 4095, 0, "thickened glass" } }) do
+    local n = tonumber(try(ae0, "countOfItemType", c[1], c[2])) or 0
+    seen[#seen + 1] = c[3] .. " " .. n
+    if n >= 16 then probe = { id = c[1], dmg = c[2] }; break end
   end
-  if not probe then say("Can't work out the chests: AE has nothing to test with."); return end
+  if not probe then say("Can't work out the chests: AE has none of " .. table.concat(seen, ", ") .. ". Put some coal blocks in AE."); return end
   say("Working out which chest touches which interface...")
   local unmapped = {}
   for name in pairs(chests) do if not map[name] then unmapped[name] = true end end
@@ -222,8 +221,12 @@ for name in pairs(chests) do if not map[name] then missingMap = true end end
 if missingMap then buildMap() end
 if not fs.exists("startup") then writeFile("startup", 'shell.run("citysupply")\n') end
 
-local lastNote = ""
+local lastNote, lastMap = "", os.clock()
 while true do
+  -- chests not worked out yet (AE had nothing to test with, or a chest was added): try again every 5 min
+  local unmapped = false
+  for name in pairs(chests) do if not map[name] then unmapped = true end end
+  if unmapped and os.clock() - lastMap > 300 then lastMap = os.clock(); buildMap() end
   local t = needs()
   if not t then
     say("Can't reach the job server.")
