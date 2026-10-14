@@ -37,6 +37,15 @@ cityfleet <slot>
 Put turtle `<slot>` (1–16) on its depot spot facing **north** first: x = −858 + 8 × (slot − 1),
 y 63, z −200. It counts its own moves (there's no GPS), so never move it by hand while it runs.
 
+Updates (v1.10 and later): turtles update themselves. Announce a release on the job server and
+every turtle on another version downloads that commit of `cityfleet` from this repo, checks it, and
+restarts into it right after its next placed block (or between jobs). The page shows each turtle's
+version, red until it has updated. Paused turtles update after Resume.
+
+```
+curl -X POST -H "X-Key: $CITY_KEY" --data "v1.11 <40-char commit>" https://<server>/city/release
+```
+
 Supply computer: wired modems on 4 ME Interfaces (ME cable on the bottom) and on 16 Ender
 Chests around them (any colours: a spare chest takes the colours of a turtle that has none;
 private or public, the same as the turtles' chests).

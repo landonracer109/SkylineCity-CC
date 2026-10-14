@@ -10,6 +10,10 @@
 --   cityfleet                   carries on after a restart (runs from startup by itself)
 --   cityfleet status            what I'm doing
 --
+-- Updates: when the job server announces a new release ("update <version> <commit>" in its answer to
+-- a report), I download that commit of cityfleet from GitHub (only from REPO), check it, and restart
+-- into it at the next safe spot (just after placing a block, or between jobs).
+--
 -- I keep track of where I am by counting my own moves (there's no GPS), so I must start exactly on
 -- my depot spot facing north, and must never be moved by hand while the program runs. If that
 -- happens: pick me up, put me back on my depot spot facing north, and run "cityfleet <slot> go".
@@ -17,7 +21,7 @@
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.09"
+local VERSION = "v1.10"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -25,6 +29,7 @@ local MIN_FUEL = 300
 local TRAVEL_FUEL = 2000    -- topped up to this before flying to a new job
 local WINDOW = 640          -- each restock loads blocks for this many upcoming placements
 local REPORT_EVERY = 60     -- seconds between progress reports (and on every new layer)
+local REPO = "https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/"
 
 local function say(msg)
   print(msg)
@@ -208,6 +213,29 @@ end
 
 -- Returns the server's answer: "pause" while the Pause button is on (nil if no report was due).
 local pausing, pauseHere = false, nil   -- (pauseHere is below)
+local updateTo, updateFailed = nil, {}   -- the release the server announced: { v = "v1.11", commit = sha }
+
+-- At a safe spot: if a new release was announced, fetch it, make sure it's whole, and restart into it.
+local function maybeUpdate()
+  local u = updateTo
+  if not u or u.v == VERSION or (updateFailed[u.commit] and os.clock() - updateFailed[u.commit] < 600) then return end
+  say("Updating to cityfleet " .. u.v .. "...")
+  local ok, r = pcall(http.get, REPO .. u.commit .. "/cityfleet")
+  local code = ok and r and r.readAll()
+  if r then r.close() end
+  if not code or not code:find('local VERSION = "' .. u.v .. '"', 1, true) or not loadstring(code) then
+    say("The download didn't work; carrying on with " .. VERSION .. " (I'll try again in 10 minutes).")
+    updateFailed[u.commit] = os.clock()
+    return
+  end
+  save()
+  local h = fs.open("cityfleet.new", "w"); h.write(code); h.close()
+  if fs.exists("cityfleet") then fs.delete("cityfleet") end
+  fs.move("cityfleet.new", "cityfleet")
+  say("Updated to " .. u.v .. ". Restarting.")
+  sleep(1)
+  os.reboot()
+end
 
 -- Sends where I am and what I need next. Any answer of "pause" (the Pause button) stops me right
 -- here until Resume, whatever sent the report, so every report checks it (a report at the start of
@@ -227,6 +255,8 @@ local function report(force, msg)
     "fuel " .. tostring(turtle.getFuelLevel()), "version " .. VERSION, "chest " .. (st.chest and (st.chest.id .. ":" .. st.chest.dmg) or "-"), "msg " .. lastMsg,
     "need " .. table.concat(need, " ") }, "\n"))
   local answer = reply and reply:match("^(%a+)")
+  local v, commit = (reply or ""):match("\nupdate (v[%d%.]+) (%x+)")
+  if v and #commit == 40 then updateTo = { v = v, commit = commit } end
   if answer == "pause" and not pausing then pauseHere(); answer = "ok" end
   return answer
 end
@@ -364,7 +394,8 @@ end
 
 -- Swaps the inventory over to what the next WINDOW placements need (nothing, between jobs), waiting
 -- while the block the next placement needs (`want`) or fuel is missing from the chest.
-local function restock(want, fuelWanted)
+local restock   -- (below the moving code: restockHere, with room for the chest made first)
+local function restockHere(want, fuelWanted)
   fuelWanted = fuelWanted or MIN_FUEL
   -- Save first: the position after my last move may not be saved yet, and refuelling here would
   -- break the fuel check that recovers a move lost in a restart (fuel one less = I moved).
@@ -483,6 +514,30 @@ end
 local function moveX(x) if pos.x ~= x then turnTo(x > pos.x and 0 or 2) end; while pos.x ~= x do step("forward") end end
 local function moveZ(z) if pos.z ~= z then turnTo(z > pos.z and 1 or 3) end; while pos.z ~= z do step("forward") end end
 local function moveY(y) while pos.y < y do step("up") end; while pos.y > y do step("down") end end
+
+-- The chest goes above me, and Minecraft won't place anything solid at y 255, the top layer of the
+-- world. So from y 254 up I first go down to 253 - out of a job by way of its dock column, which is
+-- empty all the way down - restock there, and come back.
+local relocating = false
+restock = function(want, fuelWanted)
+  if pos.y <= 253 or relocating then return restockHere(want, fuelWanted) end
+  relocating = true
+  local back = { x = pos.x, y = pos.y, z = pos.z }
+  local inJob = st.job ~= nil and st.phase == "build"
+  say("No room for my Ender Chest up here; going down to 253 to restock.")
+  if inJob then
+    moveX(st.job.enter.x); moveZ(st.job.enter.z)     -- across my own top floor (nothing above it)
+    moveX(st.job.dock.x); moveZ(st.job.dock.z)       -- out to the dock column
+  end
+  moveY(253)
+  restockHere(want, fuelWanted)
+  if inJob then
+    moveY(back.y)
+    moveX(st.job.enter.x); moveZ(st.job.enter.z)
+    moveX(back.x); moveZ(back.z)
+  end
+  relocating = false
+end
 
 local function goTo(x, y, z)
   if pos.y < y then moveY(y) end
@@ -672,6 +727,7 @@ local function build()
     st.cell = i + 1
     save()
     report(false)
+    maybeUpdate()
   end
   restock(nil)          -- hand back what's left (and top up fuel)
   -- out the way I came in: inside the job's own area to the column next to the dock, then into it
@@ -682,7 +738,7 @@ end
 
 local function loop()
   while true do
-    if st.phase == "ask" then ask()
+    if st.phase == "ask" then maybeUpdate(); ask()
     elseif st.phase == "go" then
       runLegs()
       st.phase = "build"; save()
@@ -776,6 +832,7 @@ rescan()
 if not fs.exists("startup") then writeFile("startup", 'shell.run("cityfleet")\n') end
 
 report(true)     -- check in before moving at all: a Pause pressed while I was off applies first
+maybeUpdate()
 local ok, err = pcall(loop)
 if not ok then
   if err == "Terminated" then say("Stopped (Ctrl+T). Run cityfleet to carry on."); return end

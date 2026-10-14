@@ -165,7 +165,8 @@ function render() {
     const late = r.age > 180;
     // the "Job ...: flying there" line is old news once it's building
     const msg = r.phase === "build" && /^Job /.test(r.msg || "") ? "" : (r.msg || "");
-    return `<tr><td><b>${t}</b></td><td>${doing}<div class="msg">${esc(niceNeed(msg))}</div></td>` +
+    const old = S.release && r.version && r.version !== S.release.v;
+    return `<tr><td><b>${t}</b><div class="msg ${old ? "late" : ""}">${esc(r.version || "")}${old ? " → " + esc(S.release.v) : ""}</div></td><td>${doing}<div class="msg">${esc(niceNeed(msg))}</div></td>` +
       `<td class="num">${prog}</td><td class="num">${fmt(+r.fuel)}</td><td class="num ${late ? "late" : ""}">${ago(r.age)}${late ? " ⚠" : ""}</td></tr>`;
   }).join("") || `<tr><td colspan="5" class="msg">no turtles have reported yet</td></tr>`;
   const sup = S.reports.supply;

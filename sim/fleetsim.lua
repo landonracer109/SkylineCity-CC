@@ -16,6 +16,9 @@ local ONLY = os.getenv("ONLY")      -- e.g. "g" = only jobs whose id starts with
 -- STOCKOUT="928:6,2522:0" STOCKBACK=<hours>: AE has none of those blocks until then; the sim sends
 -- the stock counts every 5 min like citysupply. No turtle should sit waiting for them.
 local PAUSE = os.getenv("PAUSE")
+-- RELEASE="seconds,version,file": at that sim time announce a release; turtles "download" it from file
+local relAt, relV, relFile = (os.getenv("RELEASE") or ""):match("^(%d+),([^,]+),(.+)$")
+relAt = tonumber(relAt)
 local STOCKOUT, STOCKBACK = {}, tonumber(os.getenv("STOCKBACK") or 0) * 3600
 for k in (os.getenv("STOCKOUT") or ""):gmatch("[^,]+") do STOCKOUT[k] = true end
 math.randomseed(SEED)
@@ -214,7 +217,7 @@ local function envFor(T)
     local x, y, z = target(dir)
     local st = T.inv[T.sel]
     if not st then return false end
-    if y > 255 then return false end   -- the top of the world
+    if y >= 255 then return false end   -- nothing solid at y 255 (the top layer) or above
     if st.id == 2522 then
       -- Extra Utilities' Magnum Torch needs a block that's solid on top under it
       local b = at(x, y - 1, z)
@@ -331,6 +334,7 @@ local function envFor(T)
   E.fs = {
     exists = function(p) local h = io.open(path(p), "r"); if h then h:close(); return true end; return false end,
     delete = function(p) os.remove(path(p)) end,
+    move = function(a, b) assert(os.rename(path(a), path(b))) end,
     getSize = function(p) local h = io.open(path(p), "rb"); if not h then return 0 end; local n = h:seek("end"); h:close(); return n end,
     open = function(p, mode)
       if mode == "a" then return { writeLine = function(s) local h = io.open(path(p), "ab"); h:write(s, "\n"); h:close() end, close = function() end } end
@@ -358,7 +362,15 @@ local function envFor(T)
   }
   local function resp(s) if not s or s == "" then return nil end; stats.http = stats.http + 1; return { readAll = function() return s end, close = function() end } end
   E.http = {
-    get = function(url) simple(.1); return resp(curl('"' .. url .. '"')) end,
+    get = function(url)
+      simple(.1)
+      if url:find("raw.githubusercontent.com", 1, true) then
+        local h = relFile and io.open(relFile, "rb"); local code = h and h:read("*a"); if h then h:close() end
+        stats.downloads = (stats.downloads or 0) + 1
+        return resp(code)
+      end
+      return resp(curl('"' .. url .. '"'))
+    end,
     post = function(url, body)
       simple(.1)
       local f = io.open(T.dir .. "/.post", "wb"); f:write(body); f:close()
@@ -402,7 +414,9 @@ textutils = { formatTime = function() return "12:00" end, serialize = ser, unser
 
 local prog = assert(loadfile(os.getenv("CITYFLEET") or "cityfleet"))
 local function start(T, runArgs)
-  local f = assert(loadfile(os.getenv("CITYFLEET") or "cityfleet"))
+  local own = T.dir .. "/cityfleet"     -- an updated copy the turtle downloaded
+  local h = io.open(own, "r"); if h then h:close() end
+  local f = assert(loadfile(h and own or os.getenv("CITYFLEET") or "cityfleet"))
   setfenv(f, envFor(T))
   T.boot = T.clock
   T.co = coroutine.create(function() return f(unpack(runArgs)) end)
@@ -437,6 +451,10 @@ while true do
       local parts = {}
       for _, t in ipairs(turtles) do parts[#parts + 1] = string.format("t%d:%d%s", t.n, (t.acts or 0) - (t.actsAt or 0), t.saidPaused and "P" or "") end
       pauseDetail = table.concat(parts, " ") assert(postBody("/resume", "", true):match("running"), "resume refused") end
+  end
+  if relAt and clock >= relAt then
+    relAt = nil
+    assert(postBody("/release", relV .. " " .. string.rep("ab", 20), true):match("^release"), "release refused")
   end
   -- stock counts, like citysupply
   if next(STOCKOUT) and clock - lastStock >= 300 then
@@ -512,6 +530,14 @@ if next(STOCKOUT) then
 end
 io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
 if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
+if relV then
+  local n = 0
+  for _, t in ipairs(turtles) do
+    local h = io.open(t.dir .. "/cityfleet", "r")
+    if h then if h:read("*a"):find('VERSION = "' .. relV .. '"', 1, true) then n = n + 1 end; h:close() end
+  end
+  io.write(string.format("release %s: %d of %d turtles updated (%d downloads)\n", relV, n, #turtles, stats.downloads or 0))
+end
 io.write(string.format("Ender Chests put in front (top of the world): %d   torch placements refused: %d\n", stats.frontChests or 0, stats.torchFails or 0))
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
   stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))

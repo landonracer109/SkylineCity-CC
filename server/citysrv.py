@@ -13,6 +13,8 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
   GET  /city/materials                      -> every block the city uses ("id:dmg" lines)
   POST /city/stock                          body: "id:dmg n" lines, AE's counts (from citysupply);
                                                jobs needing blocks AE is short of are held back
+  POST /city/release  (X-Key)  body "v1.11 <commit>" -> turtles on another version update themselves
+                                               (reports are answered "ok\nupdate v1.11 <commit>")
   POST /city/pause, /city/resume  (X-Key)   -> every turtle stops at a safe point / carries on
                                                (reports are answered "pause" while paused)
   POST /city/reset  (X-Key)                 -> forget all progress (for tests)
@@ -20,6 +22,7 @@ Coordinates on the wire are world coordinates. Inside, columns are city-local (o
 """
 
 import json
+import re
 import os
 import threading
 import time
@@ -112,6 +115,7 @@ class City:
         self.paused = s.get("paused", False)     # Pause button: every turtle stops at a safe point
         self.stock = s.get("stock", {})          # "id:dmg" -> how many AE has (from the supply computer)
         self.stockAt = s.get("stockAt", 0)
+        self.release = s.get("release")          # {"v": "v1.11", "commit": sha}: turtles update to it
 
     def save(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -119,7 +123,7 @@ class City:
         with open(tmp, "w") as f:
             json.dump({"done": sorted(self.done), "claims": self.claims, "homes": self.homes,
                        "reports": self.reports, "doneAt": self.doneAt, "paused": self.paused,
-                       "stock": self.stock, "stockAt": self.stockAt}, f)
+                       "stock": self.stock, "stockAt": self.stockAt, "release": self.release}, f)
         os.replace(tmp, self.path())
 
     # ---- routing ----
@@ -337,7 +341,7 @@ class City:
         return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": LANES,
                 "doneCount": len(self.done), "jobCount": len(self.order), "jobs": jobs, "names": self.names,
                 "origin": self.O, "span": [self.spanX, self.spanZ], "placed": placed, "rate": rate,
-                "paused": self.paused, "stockAge": int(now - self.stockAt) if self.stockAt else None}
+                "paused": self.paused, "release": self.release, "stockAge": int(now - self.stockAt) if self.stockAt else None}
 
 
 city = City()
@@ -416,7 +420,11 @@ class H(BaseHTTPRequestHandler):
                 r["at"] = time.time()
                 city.reports[q.get("t", "?")] = r
                 city.save()
-                return self.reply(200, "pause\n" if city.paused else "ok\n")   # turtles stop while paused
+                ans = "pause\n" if city.paused else "ok\n"    # turtles stop while paused
+                rel = city.release
+                if rel and r.get("version") != rel["v"]:
+                    ans += "update %s %s\n" % (rel["v"], rel["commit"])
+                return self.reply(200, ans)
             if path == "/city/stock":
                 # the supply computer's AE counts: "id:dmg n" per line
                 for line in body.splitlines():
@@ -426,6 +434,15 @@ class H(BaseHTTPRequestHandler):
                 city.stockAt = time.time()
                 city.save()
                 return self.reply(200, "ok\n")
+            if path == "/city/release":
+                if not KEY or self.headers.get("X-Key") != KEY:
+                    return self.reply(403, "wrong password\n")
+                parts = body.split()
+                if len(parts) != 2 or not re.fullmatch(r"v[\d.]+", parts[0]) or not re.fullmatch(r"[0-9a-f]{40}", parts[1]):
+                    return self.reply(400, "body: v1.11 <40-char commit>\n")
+                city.release = {"v": parts[0], "commit": parts[1]}
+                city.save()
+                return self.reply(200, "release %s %s\n" % (parts[0], parts[1]))
             if path in ("/city/pause", "/city/resume"):
                 if not KEY or self.headers.get("X-Key") != KEY:
                     return self.reply(403, "wrong password\n")
