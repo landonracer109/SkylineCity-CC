@@ -215,6 +215,12 @@ local function envFor(T)
     local st = T.inv[T.sel]
     if not st then return false end
     if y > 255 then return false end   -- the top of the world
+    if st.id == 2522 then
+      -- Extra Utilities' Magnum Torch needs a block that's solid on top under it
+      local b = at(x, y - 1, z)
+      local NS = { [4095] = true, [20] = true, [89] = true, [101] = true, [152] = true, [1763] = true, [18] = true, [2522] = true, [31] = true }
+      if not b or NS[b.id] then stats.torchFails = (stats.torchFails or 0) + 1; return false end
+    end
     if at(x, y, z) or turtleAt[key(x, y, z)] then return false end
     world[key(x, y, z)] = { id = st.id, dmg = st.dmg }
     st.qty = st.qty - 1; if st.qty == 0 then T.inv[T.sel] = nil end
@@ -366,7 +372,7 @@ local function envFor(T)
   E.sleep = function(n) if restartDue(T) then coroutine.yield("KILL") end; act(T, n) end
   E.read = function() return "" end
   E.os = setmetatable({ day = function() return 1 end, time = function() return 12 end, clock = function() return T.clock - T.boot end,
-    setComputerLabel = function() end }, { __index = os })
+    setComputerLabel = function() end, reboot = function() coroutine.yield("KILL") end }, { __index = os })
   E.textutils = textutils
   E.print = function(s)
     s = tostring(s)
@@ -506,6 +512,6 @@ if next(STOCKOUT) then
 end
 io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
 if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
-io.write(string.format("Ender Chests put in front (top of the world): %d\n", stats.frontChests or 0))
+io.write(string.format("Ender Chests put in front (top of the world): %d   torch placements refused: %d\n", stats.frontChests or 0, stats.torchFails or 0))
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
   stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))

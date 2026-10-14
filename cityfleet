@@ -17,7 +17,7 @@
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.08"
+local VERSION = "v1.09"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -533,9 +533,43 @@ end
 ---------------------------------------------------------------------------------------------------
 -- placing
 
+-- Blocks a Magnum Torch can't stand on (not solid on top in 1.6.4): glass, glowstone, bars,
+-- redstone and yellorium blocks, leaves, and another torch.
+local NOT_SOLID = { ["4095:0"] = true, ["20:0"] = true, ["89:0"] = true, ["101:0"] = true, ["152:0"] = true,
+  ["1763:0"] = true, ["18:0"] = true, ["2522:0"] = true }
+local MAGNUM = "2522:0"
+
+-- A solid building block I'm carrying (one of this job's), for propping up a torch.
+local function solidSlot()
+  if dirty then rescan() end
+  for s = 1, 15 do
+    local m = slotMat[s]
+    if m and turtle.getItemCount(s) > 0 and not NOT_SOLID[plan.mats[m].id .. ":" .. plan.mats[m].dmg] then return s end
+  end
+  return nil
+end
+
+-- A Magnum Torch only goes on a block that's solid on top. A few torch spots in the plan stand on
+-- glowstone, or on another torch over air; there I step down into the torch's spot, put a solid
+-- block of my own under it, and step back up. Returns true when it did.
+local function propUpTorch(x, y, z)
+  local s = solidSlot()
+  if not s then return false end
+  say(string.format("The torch at %d,%d,%d has nothing solid under it; putting a block there.", x, y, z))
+  step("down")                          -- into the torch's spot (empty: the torch didn't place)
+  if turtle.detectDown() then turtle.digDown(); dirty = true end
+  s = solidSlot()
+  local ok = false
+  if s then turtle.select(s); ok = turtle.placeDown() end
+  step("up")
+  return ok
+end
+
 local function placeCell(i)
   local x, y, z, m = plan.xs[i], plan.ys[i], plan.zs[i], plan.ms[i]
   goTo(x, y + 1, z)
+  local torch = (plan.mats[m].id .. ":" .. plan.mats[m].dmg) == MAGNUM
+  local fails, propped = 0, false
   for _ = 1, 200 do
     local s = slotFor(m)
     if not s then
@@ -548,7 +582,13 @@ local function placeCell(i)
       elseif turtle.placeDown() then
         return
       else
-        turtle.attackDown(); sleep(0.5)
+        fails = fails + 1
+        if torch and fails >= 3 and not propped then
+          propped = true
+          if not propUpTorch(x, y, z) then say("No solid block to put under the torch; I need one of this job's blocks.") end
+        else
+          turtle.attackDown(); sleep(0.5)
+        end
       end
     end
   end
