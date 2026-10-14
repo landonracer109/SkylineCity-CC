@@ -178,12 +178,15 @@ function R(seed) { const f = mulberry(seed); return { f, int: (a, b) => a + Math
 // ---------- building helpers ----------
 function makeB(name, style) { return { name, style, m: new Map(), put(x, y, z, k) { this.m.set(x + "," + y + "," + z, k); } }; }
 // perimeter of a box; fn(x, y, z, u, corner) -> block key or null. u runs along each face.
-function shell(b, x0, z0, w, d, y0, y1, fn) {
+// u counts along each face from the shell's own corner, or from org = [x, z] when given: shells that
+// share a wall (a bridge across two towers) must count from the same point, or their stripes clash.
+function shell(b, x0, z0, w, d, y0, y1, fn, org) {
   const x1 = x0 + w - 1, z1 = z0 + d - 1;
+  const ox = org ? org[0] : x0, oz = org ? org[1] : z0;
   for (let y = y0; y < y1; y++) for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) {
     if (x !== x0 && x !== x1 && z !== z0 && z !== z1) continue;
     const corner = (x === x0 || x === x1) && (z === z0 || z === z1);
-    const u = (z === z0 || z === z1) ? x - x0 : z - z0;
+    const u = (z === z0 || z === z1) ? x - ox : z - oz;
     const k = fn(x, y, z, u, corner, y - y0); if (k) b.put(x, y, z, k);
   }
 }
@@ -410,8 +413,9 @@ const WIDE = {
     const F = r.pick(["quartz", "silver", "stone", "electrum", "obsidian"]), A = r.pick(["gold", "diamond", "redstone", "glow", "emerald"]);
     const by = H - Math.max(10, Math.round(H * .18));
     const pat = (u, c, y) => c ? F : (y % 4 === 0 || u % 4 === 0 ? F : lit(r, .3));
-    for (const tx of [x0 + 1, x0 + 31]) shell(b, tx, z0 + 3, 14, 14, 0, H, (x, y, z, u, c) => pat(u, c, y));
-    shell(b, x0 + 1, z0 + 3, 44, 14, by, H, (x, y, z, u, c) => pat(u, c, y));
+    const org = [x0 + 1, z0 + 3];   // one stripe count for both towers and the bridge across them
+    for (const tx of [x0 + 1, x0 + 31]) shell(b, tx, z0 + 3, 14, 14, 0, H, (x, y, z, u, c) => pat(u, c, y), org);
+    shell(b, x0 + 1, z0 + 3, 44, 14, by, H, (x, y, z, u, c) => pat(u, c, y), org);
     plate(b, x0 + 15, z0 + 3, 16, 14, by - 1, A);
     plate(b, x0 + 1, z0 + 3, 44, 14, H, F); ring(b, x0 + 1, z0 + 3, 44, 14, H, A);
     antenna(b, x0 + 8, z0 + 10, H + 1, r.int(6, 12), "redstone"); antenna(b, x0 + 38, z0 + 10, H + 1, r.int(6, 12), "redstone");
