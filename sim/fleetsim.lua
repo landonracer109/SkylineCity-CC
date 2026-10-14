@@ -124,7 +124,14 @@ local function restartDue(T)
   return false
 end
 
-local function chestAbove(T) local b = at(T.x, T.y + 1, T.z); return b and b.id == ENDER and b.dmg == T.n end
+local DXc = { [0] = 1, 0, -1, 0 }
+local DZc = { [0] = 0, 1, 0, -1 }
+local function chestAt(T, side)
+  local b
+  if side == "top" then b = at(T.x, T.y + 1, T.z) elseif side == "front" then b = at(T.x + DXc[T.f], T.y, T.z + DZc[T.f]) end
+  return b and b.id == ENDER and b.dmg == T.n
+end
+local function chestAbove(T) return chestAt(T, "top") end
 
 -- AE: keeps 2 stacks of each block in the turtle's current build file, and a stack of coal blocks
 local function aeFill(T)
@@ -178,7 +185,7 @@ local function envFor(T)
     if kill and math.random() < .5 then coroutine.yield("KILL") end
     act(T, .4)
     local x, y, z = target(dir)
-    if at(x, y, z) or turtleAt[key(x, y, z)] then
+    if y > 255 or at(x, y, z) or turtleAt[key(x, y, z)] then
       if turtleAt[key(x, y, z)] then stats.waitsTurtle = stats.waitsTurtle + 1 end
       if kill then coroutine.yield("KILL") end
       return false
@@ -207,6 +214,7 @@ local function envFor(T)
     local x, y, z = target(dir)
     local st = T.inv[T.sel]
     if not st then return false end
+    if y > 255 then return false end   -- the top of the world
     if at(x, y, z) or turtleAt[key(x, y, z)] then return false end
     world[key(x, y, z)] = { id = st.id, dmg = st.dmg }
     st.qty = st.qty - 1; if st.qty == 0 then T.inv[T.sel] = nil end
@@ -250,6 +258,18 @@ local function envFor(T)
       T.fuel = math.min(20000, T.fuel + 720 * n); stats.coal = stats.coal + n; st.qty = st.qty - n; if st.qty == 0 then T.inv[T.sel] = nil end
       return true
     end,
+    drop = function()
+      simple(.05)
+      local st = T.inv[T.sel]; if not st then return false end
+      if chestAt(T, "front") then
+        local inv = T.chest
+        for s2 = 1, 27 do local c = inv[s2]; if c and c.id == st.id and c.dmg == st.dmg and c.qty < 64 then local k = math.min(st.qty, 64 - c.qty); c.qty = c.qty + k; st.qty = st.qty - k end end
+        for s2 = 1, 27 do if st.qty > 0 and not inv[s2] then inv[s2] = { id = st.id, dmg = st.dmg, qty = st.qty }; st.qty = 0 end end
+        if st.qty == 0 then T.inv[T.sel] = nil end
+        return true
+      end
+      T.inv[T.sel] = nil; return true
+    end,
     dropUp = function()
       simple(.05)
       local st = T.inv[T.sel]; if not st then return false end
@@ -271,7 +291,7 @@ local function envFor(T)
     getAllStacks = function() stats.perCalls = stats.perCalls + 1; act(T, .05); local t = {}; for s = 1, 27 do t[s] = stackTable(T.chest[s]) end; return t end,
     pushItem = function(dir, cs, n, ts)
       stats.perCalls = stats.perCalls + 1; act(T, .05)
-      assert(dir == "down" and ts >= 1 and ts <= 16)
+      assert(ts >= 1 and ts <= 16)
       local c, t = T.chest[cs], T.inv[ts]
       if not c then return 0 end
       if t and (t.id ~= c.id or t.dmg ~= c.dmg) then return 0 end
@@ -285,12 +305,12 @@ local function envFor(T)
   E.peripheral = {
     getMethods = function(side)
       if side == "left" then return { "getAllStacks", "getStackInSlot" } end
-      if side == "top" and chestAbove(T) then return { "getAllStacks", "pushItem" } end
+      if (side == "top" or side == "front") and chestAt(T, side) then return { "getAllStacks", "pushItem" } end
       return nil
     end,
     wrap = function(side)
       if side == "left" then return selfP end
-      if side == "top" and chestAbove(T) then stats.restocks = stats.restocks + 1; return chestP end
+      if (side == "top" or side == "front") and chestAt(T, side) then stats.restocks = stats.restocks + 1; if side == "front" then stats.frontChests = (stats.frontChests or 0) + 1 end; return chestP end
       return nil
     end,
     getType = function(side)
@@ -374,9 +394,9 @@ local function ser(v)
 end
 textutils = { formatTime = function() return "12:00" end, serialize = ser, unserialize = function(s) local f = loadstring("return " .. s); if not f then return nil end; local ok, v = pcall(f); return ok and v or nil end }
 
-local prog = assert(loadfile("cityfleet"))
+local prog = assert(loadfile(os.getenv("CITYFLEET") or "cityfleet"))
 local function start(T, runArgs)
-  local f = assert(loadfile("cityfleet"))
+  local f = assert(loadfile(os.getenv("CITYFLEET") or "cityfleet"))
   setfenv(f, envFor(T))
   T.boot = T.clock
   T.co = coroutine.create(function() return f(unpack(runArgs)) end)
@@ -486,5 +506,6 @@ if next(STOCKOUT) then
 end
 io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
 if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
+io.write(string.format("Ender Chests put in front (top of the world): %d\n", stats.frontChests or 0))
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
   stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))

@@ -17,7 +17,7 @@
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.07"
+local VERSION = "v1.08"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -249,12 +249,54 @@ end
 ---------------------------------------------------------------------------------------------------
 -- the Ender Chest
 
-local function placeChest()
-  if turtle.getItemCount(CHEST) == 0 and turtle.detectUp() then
-    local p = peripheral.wrap("top")
+-- The Ender Chest goes above me, except at the top of the world (y 255), where there is no room
+-- above: then it goes in front (the air up there is empty) and items move through its side.
+local WORLD_TOP = 255
+local chestAt = "top"
+local TOWARD_ME = { [0] = "west", "north", "east", "south" }   -- chest in front of me (facing f) -> me
+local function chestDir() return chestAt == "top" and "down" or TOWARD_ME[pos.f] end
+local function dropToChest() if chestAt == "top" then return turtle.dropUp() end; return turtle.drop() end
+
+local function readChest(side)
+  for _ = 1, 20 do
+    local p = peripheral.wrap(side)
     if p and p.getAllStacks then return p end
+    sleep(0.1)
+  end
+  return nil
+end
+
+local turnTo   -- (defined with the moving code below)
+local function placeChest()
+  -- after a restart in the middle of restocking the chest is still out
+  if turtle.getItemCount(CHEST) == 0 then
+    for _, side in ipairs({ "top", "front" }) do
+      local p = peripheral.wrap(side)
+      if p and p.getAllStacks then chestAt = side; return p end
+    end
   end
   turtle.select(CHEST)
+  if pos.y >= WORLD_TOP then
+    chestAt = "front"
+    for tries = 1, 400 do
+      if turtle.place() then
+        local p = readChest("front")
+        if p then return p end
+        error("The Ender Chest in front of me can't be read. Is OpenPeripherals installed?")
+      end
+      if turtle.detect() and peripheral.getType("front") ~= "turtle" then
+        turtle.dig(); dirty = true
+      elseif turtle.getItemCount(CHEST) == 0 then
+        tell("Put my Ender Chest back in slot 16."); sleep(5)
+      else
+        turnTo((pos.f + 1) % 4)          -- another turtle there: try the next side
+        if tries % 4 == 0 then sleep(2) end
+      end
+      turtle.select(CHEST)
+    end
+    error("No room round me for the Ender Chest at the top of the world.")
+  end
+  chestAt = "top"
   while not turtle.placeUp() do
     if turtle.detectUp() and peripheral.getType("top") ~= "turtle" then
       turtle.digUp(); dirty = true
@@ -264,17 +306,15 @@ local function placeChest()
     end
     turtle.select(CHEST)
   end
-  for _ = 1, 20 do
-    local p = peripheral.wrap("top")
-    if p and p.getAllStacks then return p end
-    sleep(0.1)
-  end
+  local p = readChest("top")
+  if p then return p end
   error("The Ender Chest above me can't be read. Is OpenPeripherals installed?")
 end
 
 local function pickUpChest()
   turtle.select(CHEST)
-  turtle.digUp()
+  if chestAt == "front" then turtle.dig() else turtle.digUp() end
+  chestAt = "top"
   turtle.select(1)
   dirty = true
 end
@@ -302,7 +342,7 @@ local function refuelFrom(chest, upTo)
       local key = type(stack) == "table" and stack.id and (stack.id .. ":" .. stack.dmg)
       if key and FUEL[key] and not notFuel[key] then
         found = true
-        chest.pushItem("down", cs, 64, slot)
+        chest.pushItem(chestDir(), cs, 64, slot)
         turtle.select(slot)
         if turtle.refuel(0) then
           local before = fuelLevel()
@@ -314,7 +354,7 @@ local function refuelFrom(chest, upTo)
         else
           notFuel[key] = true
         end
-        if turtle.getItemCount(slot) > 0 then turtle.dropUp() end
+        if turtle.getItemCount(slot) > 0 then dropToChest() end
         break
       end
     end
@@ -348,7 +388,7 @@ local function restock(want, fuelWanted)
           keep[m] = (keep[m] or 0) + 1
         else
           turtle.select(s)
-          turtle.dropUp()
+          dropToChest()
           if turtle.getItemCount(s) > 0 then say("My Ender Chest is full; can't hand back slot " .. s .. ".") end
         end
       end
@@ -367,7 +407,7 @@ local function restock(want, fuelWanted)
               if have >= target or (stack.qty or 0) <= 0 then break end
               local cnt = turtle.getItemCount(s)
               if (slotMat[s] == m and cnt < 64) or cnt == 0 then
-                local moved = chest.pushItem("down", cs, math.min(64 - cnt, target - have, stack.qty), s) or 0
+                local moved = chest.pushItem(chestDir(), cs, math.min(64 - cnt, target - have, stack.qty), s) or 0
                 if moved > 0 then slotMat[s] = m end
                 have, stack.qty = have + moved, stack.qty - moved
               end
@@ -394,7 +434,7 @@ local DZ = { [0] = 0, 1, 0, -1 }
 local SIDE = { forward = "front", up = "top", down = "bottom" }
 local mayDig = true      -- false on the lanes: nothing should be there, so ask instead of digging
 
-local function turnTo(f)
+function turnTo(f)   -- (the local declared above placeChest)
   while pos.f ~= f do
     if (pos.f + 1) % 4 == f then turtle.turnRight(); pos.f = f
     else turtle.turnLeft(); pos.f = (pos.f + 3) % 4 end
@@ -685,9 +725,11 @@ if st.pend then
   st.pend = nil
   save()
 end
-if turtle.getItemCount(CHEST) == 0 and turtle.detectUp() then
-  local p = peripheral.wrap("top")
-  if p and p.getAllStacks then pickUpChest() end
+if turtle.getItemCount(CHEST) == 0 then
+  for _, side in ipairs({ "top", "front" }) do
+    local p = peripheral.wrap(side)
+    if p and p.getAllStacks then chestAt = side; pickUpChest(); break end
+  end
 end
 if st.phase == "build" or st.phase == "go" or st.phase == "leave" then plan = loadPlan() end
 rescan()
