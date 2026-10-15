@@ -22,11 +22,13 @@
 -- and the server tells me whether I found it where I should have. Then I fly back to my spot and
 -- start work, or, if not, stop there with a message. It catches a spot that is off in y or z (and
 -- in x only across a step of the edge), so check each turtle's x with F3 too.
+-- With nothing to do (the server says wait) I wait up at the wait height, above everything the
+-- build places, straight up from where I finished, so I'm never in another turtle's way (v1.12).
 -- Travelling, I fly at one height per direction (east, west, south, north each have their own lane
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.11"
+local VERSION = "v1.12"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -407,6 +409,7 @@ local function restockHere(want, fuelWanted)
   save()
   say(string.format("Restocking at block %d (fuel %s)", st.cell or 0, tostring(turtle.getFuelLevel())))
   local chest = placeChest()
+  local waited = false
   while true do
     local need, order = upcoming()
     local slots, used = {}, 0
@@ -457,9 +460,11 @@ local function restockHere(want, fuelWanted)
     if (not want or slotFor(want)) and fuelLevel() >= fuelWanted then break end
     tell("My Ender Chest needs " .. (want and not slotFor(want) and plan.mats[want].name or "fuel (coal)") .. ". Waiting...")
     report(true)
+    waited = true
     sleep(10)
   end
   pickUpChest()
+  if waited then tell("Got what I needed from my Ender Chest; carrying on.") end
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -667,6 +672,8 @@ local function ask()
   local head = L[1] or ""
   if head:match("^wait") then
     local secs, why = head:match("^wait (%d+) ?(.*)")
+    -- wait above everything (the column I'm in is clear up there: I came down it), out of everyone's way
+    if st.lanes.wait < 256 and pos.y < st.lanes.wait then moveY(st.lanes.wait); save() end
     if why ~= lastMsg then tell("Waiting: " .. (why or "")) end
     sleep(tonumber(secs) or 30)
     return
