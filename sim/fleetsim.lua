@@ -6,6 +6,12 @@
 -- current build file plus coal blocks. The whole server restarts now and then: every turtle's
 -- program is killed (sometimes just after a move whose answer never arrived) and started again
 -- from startup. At the end every block of every job is checked.
+-- Repairing a pasted city: PASTE_JOBS=<full-city jobs dir> PASTE_OFF="dx,dy,dz" CUT="x0,x1,lastZ;..."
+-- pre-places every block of the full city north of the cut (shifted), plus a dock block under each
+-- depot spot; none of them may be dug. DEPOT_X0/DEPOT_Z place the depot row (home y = the jobs'
+-- origin y). OFFSET="n:dx,dy,dz;..." puts turtle n that far off its depot spot (it doesn't know):
+-- its position check must stop it without digging anything. EARLY=n adds n server restarts in the
+-- first 2 minutes (during the position checks). LATE="n:seconds;..." starts turtle n that late.
 
 local JOBS, N, RESTARTS, SEED, HOURS = arg[1], tonumber(arg[2] or 4), tonumber(arg[3] or 3), tonumber(arg[4] or 1), tonumber(arg[5] or 30)
 local SERVER = os.getenv("SERVER") or "http://127.0.0.1:8097/city"
@@ -36,6 +42,49 @@ local function curl(args)
   local p = io.popen("curl -s -m 30 " .. args)
   local s = p:read("*a"); p:close()
   return s
+end
+-- The turtles' requests: on Windows starting a curl process for each one is very slow, so there
+-- they go straight over a socket (LuaJIT FFI, ws2_32). Returns the body, whatever the status (like curl -s).
+local fastHttp
+if WIN and jit then
+  local ffi = require("ffi")
+  ffi.cdef[[
+    typedef struct { unsigned short family; unsigned short port; unsigned int addr; char zero[8]; } fs_sockaddr_in;
+    int WSAStartup(unsigned short ver, void *data);
+    uintptr_t socket(int af, int type, int proto);
+    int connect(uintptr_t s, const fs_sockaddr_in *addr, int len);
+    int send(uintptr_t s, const char *buf, int len, int flags);
+    int recv(uintptr_t s, char *buf, int len, int flags);
+    int closesocket(uintptr_t s);
+    unsigned short htons(unsigned short v);
+    unsigned long inet_addr(const char *cp);
+  ]]
+  local ws = ffi.load("ws2_32")
+  ws.WSAStartup(0x0202, ffi.new("char[512]"))
+  local buf = ffi.new("char[65536]")
+  fastHttp = function(url, body)
+    local host, port, path = url:match("^http://([%d%.]+):(%d+)(/.*)$")
+    if not host then return nil end
+    local s = ws.socket(2, 1, 6)
+    local a = ffi.new("fs_sockaddr_in")
+    a.family, a.port, a.addr = 2, ws.htons(tonumber(port)), ws.inet_addr(host)
+    if ws.connect(s, a, ffi.sizeof(a)) ~= 0 then ws.closesocket(s); return nil end
+    local req = (body and "POST " or "GET ") .. path .. " HTTP/1.0\r\nHost: " .. host .. "\r\nContent-Length: " .. #(body or "") .. "\r\n\r\n" .. (body or "")
+    local sent = 0
+    while sent < #req do
+      local n = ws.send(s, req:sub(sent + 1), #req - sent, 0)
+      if n <= 0 then ws.closesocket(s); return nil end
+      sent = sent + n
+    end
+    local parts = {}
+    while true do
+      local n = ws.recv(s, buf, 65536, 0)
+      if n <= 0 then break end
+      parts[#parts + 1] = ffi.string(buf, n)
+    end
+    ws.closesocket(s)
+    return (table.concat(parts):match("^HTTP/[%d%.]+ %d+.-\r\n\r\n(.*)$"))
+  end
 end
 local function reset()
   local f = io.open(DIR .. "/body", "wb"); f:write(os.getenv("PREDONE") or ""); f:close()
@@ -94,6 +143,8 @@ end
 local clock = 0            -- the scheduler's time (the earliest turtle's)
 local restartTimes = {}
 for i = 1, RESTARTS do restartTimes[i] = math.random(600, HOURS * 3600 * 0.6) end
+for _ = 1, tonumber(os.getenv("EARLY") or 0) do restartTimes[#restartTimes + 1] = math.random(5, 120) end
+table.sort(restartTimes)
 table.sort(restartTimes)
 local stats = { moves = 0, turns = 0, places = 0, digs = 0, perCalls = 0, restocks = 0, restarts = 0, waitsTurtle = 0, http = 0, lostMoves = 0, coal = 0 }
 
@@ -101,13 +152,42 @@ local stats = { moves = 0, turns = 0, places = 0, digs = 0, perCalls = 0, restoc
 local DX = { [0] = 1, 0, -1, 0 }
 local DZ = { [0] = 0, 1, 0, -1 }
 local turtles = {}
-local DEPOT_X0, DEPOT_STEP, DEPOT_Z, GROUND = -858, 8, -200, 63
+local DEPOT_X0, DEPOT_STEP, DEPOT_Z = tonumber(os.getenv("DEPOT_X0") or -858), 8, tonumber(os.getenv("DEPOT_Z") or -200)
+local GROUND
+do local f = io.open(JOBS .. "/jobs.json", "rb"); local jt = f:read("*a"); f:close(); GROUND = tonumber(jt:match('"origin"%s*:%s*%[%s*%-?%d+,%s*(%-?%d+)')) end
+local OFFSET = {}
+for n, dx, dy, dz in (os.getenv("OFFSET") or ""):gmatch("(%d+):(%-?%d+),(%-?%d+),(%-?%d+)") do OFFSET[tonumber(n)] = { tonumber(dx), tonumber(dy), tonumber(dz) } end
+-- the pasted city and the docks
+local pasted = 0
+if os.getenv("PASTE_JOBS") then
+  local dx, dy, dz = os.getenv("PASTE_OFF"):match("(%-?%d+),(%-?%d+),(%-?%d+)"); dx, dy, dz = tonumber(dx), tonumber(dy), tonumber(dz)
+  local cut = {}
+  for a, b, z in os.getenv("CUT"):gmatch("(%-?%d+),(%-?%d+),(%-?%d+)") do cut[#cut + 1] = { tonumber(a), tonumber(b), tonumber(z) } end
+  local function lastZ(x) for _, c in ipairs(cut) do if x >= c[1] and x <= c[2] then return c[3] end end end
+  local PJ = os.getenv("PASTE_JOBS")
+  local p = io.popen(WIN and ('dir /b "' .. PJ:gsub("/", "\\") .. '"') or ('ls "' .. PJ .. '"'))
+  for f in p:lines() do
+    if f:match("%.txt$") and f ~= "water.txt" then
+      local q = readPlan(PJ .. "/" .. f)
+      for _, c in ipairs(q.cells) do
+        local x, y, z = c[1] + dx, c[2] + dy, c[3] + dz
+        local lz = lastZ(x)
+        if lz and z <= lz then local m = q.mats[c[4]]; world[key(x, y, z)] = { id = m.id, dmg = m.dmg, pasted = true }; pasted = pasted + 1 end
+      end
+    end
+  end
+  p:close()
+  io.stderr:write(string.format("pasted city: %d blocks\n", pasted))
+end
 
 local function stackTable(st, names) return st and { id = st.id, dmg = st.dmg, qty = st.qty, name = "x", rawName = "x" } or nil end
 
 local function makeTurtle(n)
-  local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * (n - 1), y = GROUND, z = DEPOT_Z, f = 3, fuel = 2500, sel = 1, inv = {},
+  local o = OFFSET[n] or { 0, 0, 0 }
+  local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * (n - 1) + o[1], y = GROUND + o[2], z = DEPOT_Z + o[3], f = 3, digs = 0, fuel = 2500, sel = 1, inv = {},
     clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
+  T.start = { T.x, T.y, T.z }
+  if os.getenv("PASTE_JOBS") then world[key(T.x, T.y - 1, T.z)] = { id = 1, dmg = 0, pasted = true }; pasted = pasted + 1 end   -- its dock
   T.inv[16] = { id = ENDER, dmg = n, qty = 1 }
   mkdir(T.dir)
   turtleAt[key(T.x, T.y, T.z)] = T
@@ -166,6 +246,7 @@ local function envFor(T)
   local E = setmetatable({}, { __index = _G })
   local function target(dir)
     if dir == "up" then return T.x, T.y + 1, T.z elseif dir == "down" then return T.x, T.y - 1, T.z end
+    if dir == "back" then return T.x - DX[T.f], T.y, T.z - DZ[T.f] end
     return T.x + DX[T.f], T.y, T.z + DZ[T.f]
   end
   local function store(id, dmg, qty)
@@ -208,7 +289,11 @@ local function envFor(T)
     local x, y, z = target(dir)
     local b = world[key(x, y, z)]
     if not b then return false end
-    world[key(x, y, z)] = nil; stats.digs = stats.digs + 1
+    world[key(x, y, z)] = nil; stats.digs = stats.digs + 1; T.digs = T.digs + 1
+    if b.pasted then
+      stats.pastedDigs = (stats.pastedDigs or 0) + 1
+      if stats.pastedDigs <= 10 then io.stderr:write(string.format("PASTED BLOCK DUG by t%d at %d,%d,%d (%d:%d)\n", T.n, x, y, z, b.id, b.dmg)) end
+    end
     store(b.id, b.dmg, 1)
     return true
   end
@@ -238,7 +323,7 @@ local function envFor(T)
     return b.id == st.id and b.dmg == st.dmg
   end
   E.turtle = {
-    forward = function() return move("forward") end, up = function() return move("up") end, down = function() return move("down") end,
+    forward = function() return move("forward") end, back = function() return move("back") end, up = function() return move("up") end, down = function() return move("down") end,
     turnLeft = function() simple(.4); T.f = (T.f + 3) % 4; stats.turns = stats.turns + 1; trace("turned left"); return true end,
     turnRight = function() simple(.4); T.f = (T.f + 1) % 4; stats.turns = stats.turns + 1; trace("turned right"); return true end,
     detect = function() return detect("forward") end, detectUp = function() return detect("up") end, detectDown = function() return detect("down") end,
@@ -369,12 +454,17 @@ local function envFor(T)
         stats.downloads = (stats.downloads or 0) + 1
         return resp(code)
       end
+      if fastHttp then return resp(fastHttp(url)) end
       return resp(curl('"' .. url .. '"'))
     end,
     post = function(url, body)
       simple(.1)
-      local f = io.open(T.dir .. "/.post", "wb"); f:write(body); f:close()
-      local s = curl('--data-binary @"' .. T.dir .. '/.post" "' .. url .. '"')
+      local s
+      if fastHttp then s = fastHttp(url, body)
+      else
+        local f = io.open(T.dir .. "/.post", "wb"); f:write(body); f:close()
+        s = curl('--data-binary @"' .. T.dir .. '/.post" "' .. url .. '"')
+      end
       if os.getenv("DEBUGHTTP") and url:find("/report") then
         io.stderr:write(string.format("%7.0f t%d %s -> %s\n", T.clock, T.n, body:match("msg ([^\n]*)") or "", ((s or "nil"):gsub("\n", ""))))
       end
@@ -422,7 +512,15 @@ local function start(T, runArgs)
   T.co = coroutine.create(function() return f(unpack(runArgs)) end)
 end
 
-for n = 1, N do start(makeTurtle(n), { tostring(n), SERVER, "go" }) end
+-- LATE="n:seconds;...": turtle n is started that late (after others may have built in front of it)
+local LATE = {}
+for n, s in (os.getenv("LATE") or ""):gmatch("(%d+):(%d+)") do LATE[tonumber(n)] = tonumber(s) end
+for n = 1, N do
+  local T = makeTurtle(n)
+  T.clock = LATE[n] or 0
+  while restartTimes[T.restartIdx + 1] and restartTimes[T.restartIdx + 1] <= T.clock do T.restartIdx = T.restartIdx + 1 end   -- (before it was started)
+  start(T, { tostring(n), SERVER, "go" })
+end
 
 -- ---------- run ----------
 local lastAE, lastShow, deadline = -1e9, 0, HOURS * 3600
@@ -466,7 +564,7 @@ while true do
   end
   if clock > deadline then break end
   local done = true
-  for _, t in ipairs(turtles) do if not t.finished then done = false end end
+  for _, t in ipairs(turtles) do if not t.finished and t.co then done = false end end
   if done then ended = "all turtles home, nothing left"; break end
   -- stalled: nothing placed for 2 sim-hours while work is left
   if stats.places ~= (lastPlaces or -1) then lastPlaces, lastPlaceAt = stats.places, clock end
@@ -511,13 +609,23 @@ for k, b in pairs(world) do
     local x, _, z = k:match("(%-?%d+),(%-?%d+),(%-?%d+)")
     local lx, lz = tonumber(x) - PLANT_ORIGIN[1], tonumber(z) - PLANT_ORIGIN[3]
     if lx >= 0 and lx <= 260 and lz >= 0 and lz <= 253 then plantsLeft = plantsLeft + 1; if plantsLeft <= 5 then io.write("  plant left at ", k, "\n") end end
-  elseif not want[k] then extra = extra + 1; if extra <= 5 then io.write("  extra block ", k, " id ", b.id, ":", b.dmg, "\n") end end
+  elseif not want[k] and not b.pasted then extra = extra + 1; if extra <= 5 then io.write("  extra block ", k, " id ", b.id, ":", b.dmg, "\n") end end
 end
 if PLANTS > 0 then io.write(string.format("plants left in the city area: %d\n", plantsLeft)) end
 for _, T in ipairs(turtles) do
   io.write(string.format("\n== turtle %d at %d,%d,%d facing %d, fuel %d, clock %.1f h ==\n", T.n, T.x, T.y, T.z, T.f, T.fuel, T.clock / 3600))
   local from = tonumber(os.getenv("LOGLINES") or 12)
   for i = math.max(1, #T.log - from + 1), #T.log do io.write(T.log[i], "\n") end
+end
+if pasted > 0 then
+  local left = 0
+  for _, b in pairs(world) do if b.pasted then left = left + 1 end end
+  io.write(string.format("\npasted blocks: %d, still there %d, dug %d\n", pasted, left, stats.pastedDigs or 0))
+end
+for n in pairs(OFFSET) do
+  local T = turtles[n]
+  io.write(string.format("misplaced turtle %d: started at %d,%d,%d, now %d,%d,%d facing %d, digs %d, program %s\n", n, T.start[1], T.start[2], T.start[3],
+    T.x, T.y, T.z, T.f, T.digs, T.co and "still running" or "ended"))
 end
 local mb = {}
 for id, n in pairs(missingBy) do mb[#mb + 1] = id .. ":" .. n end

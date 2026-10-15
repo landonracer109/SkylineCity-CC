@@ -17,11 +17,16 @@
 -- I keep track of where I am by counting my own moves (there's no GPS), so I must start exactly on
 -- my depot spot facing north, and must never be moved by hand while the program runs. If that
 -- happens: pick me up, put me back on my depot spot facing north, and run "cityfleet <slot> go".
+-- Position check (v1.11; when the job server has one, e.g. for repairing a pasted city): on a first
+-- start I fly north from my depot spot at its height, digging nothing, until I find the city's edge,
+-- and the server tells me whether I found it where I should have. Then I fly back to my spot and
+-- start work, or, if not, stop there with a message. It catches a spot that is off in y or z (and
+-- in x only across a step of the edge), so check each turtle's x with F3 too.
 -- Travelling, I fly at one height per direction (east, west, south, north each have their own lane
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.10"
+local VERSION = "v1.11"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -736,9 +741,80 @@ local function build()
   save()
 end
 
+-- The position check (first start, when the server has one). Plain moves only, so nothing is ever
+-- dug, and I face north the whole time (back() on the way back), so a restart can't lose a turn.
+-- A move whose answer a restart lost is recovered from the fuel, like any other (st.pend).
+local function plainMove(back)
+  local nz = pos.z + (back and 1 or -1)
+  st.pend = { fuel = turtle.getFuelLevel(), x = pos.x, y = pos.y, z = nz }
+  save()
+  local told = false
+  while true do
+    local moved
+    if back then moved = turtle.back() else moved = turtle.forward() end
+    if moved then break end
+    if not back and turtle.detect() and peripheral.getType("front") ~= "turtle" then
+      st.pend = nil; save()
+      return false
+    end
+    if not told then say("Something is in my way (another turtle or a mob?); waiting."); told = true end
+    sleep(1 + math.random())
+  end
+  pos.z, st.pend = nz, nil
+  save()
+  return true
+end
+
+local function checkPosition()
+  local c = st.check
+  while not c.steps and not c.found do
+    local reply = get(string.format("/check?t=%s&x=%d", cfg.label, pos.x))
+    local head = reply and lines(reply)[1] or ""
+    if not reply then say("Can't reach the job server for my position check; trying again in 30 s."); sleep(30)
+    elseif head == "none" then st.check, st.phase = nil, "ask"; save(); return
+    elseif head:match("^check %d+") then c.steps = tonumber(head:match("^check (%d+)")); save()
+    else
+      local secs, why = head:match("^wait (%d+) ?(.*)")
+      if "Waiting: " .. (why or head) ~= lastMsg then tell("Waiting: " .. (why or head)) end
+      sleep(tonumber(secs) or 30)
+    end
+  end
+  if not c.found then
+    -- (on my spot there's room for the Ender Chest above me)
+    if pos.z == st.home.z and fuelLevel() < 2 * c.steps + 20 then restock(nil, TRAVEL_FUEL) end
+    say("Checking my position: flying north to the city's edge.")
+    while true do
+      local n = st.home.z - pos.z
+      if n > 0 and turtle.detectDown() then c.found = { e = "down", z = pos.z }; break end
+      if n >= c.steps then c.found = { e = "none", z = pos.z }; break end
+      if turtle.detect() and peripheral.getType("front") ~= "turtle" then c.found = { e = "front", z = pos.z }; break end
+      if not plainMove(false) then c.found = { e = "front", z = pos.z }; break end
+    end
+    save()
+  end
+  while not c.verdict do
+    local reply = get(string.format("/check?t=%s&x=%d&z=%d&e=%s", cfg.label, pos.x, c.found.z, c.found.e))
+    if reply then c.verdict = lines(reply)[1] or "bad (empty answer)"; save()
+    else say("Can't reach the job server with my position check; trying again in 30 s."); sleep(30) end
+  end
+  while pos.z < st.home.z do plainMove(true) end
+  if c.verdict == "ok" then
+    st.check, st.phase = nil, "ask"
+    save()
+    tell("Position checked: I'm where I think I am.")
+  else
+    st.phase = "stopped"
+    st.stopped = string.format("I'm not where I think I am: %s Check my depot spot (%d,%d,%d, facing north), then run: cityfleet %d go",
+      (c.verdict:gsub("^bad ?", "")), st.home.x, st.home.y, st.home.z, cfg.slot)
+    save()
+  end
+end
+
 local function loop()
   while true do
-    if st.phase == "ask" then maybeUpdate(); ask()
+    if st.phase == "check" then checkPosition()
+    elseif st.phase == "stopped" then tell(st.stopped); return
+    elseif st.phase == "ask" then maybeUpdate(); ask()
     elseif st.phase == "go" then
       runLegs()
       st.phase = "build"; save()
@@ -804,7 +880,7 @@ if args[1] then
   if args[#args] ~= "go" then print("Enter to start, Ctrl+T to cancel."); read() end
   if turtle.getItemCount(CHEST) == 0 then print("No Ender Chest in slot 16."); return end
   local cs = self_.getStackInSlot(CHEST)
-  st = { phase = "ask", pos = { x = tonumber(hx), y = tonumber(hy), z = tonumber(hz), f = 3 },
+  st = { phase = "check", check = {}, pos ={ x = tonumber(hx), y = tonumber(hy), z = tonumber(hz), f = 3 },
     home = { x = tonumber(hx), y = tonumber(hy), z = tonumber(hz) }, chest = cs and { id = cs.id, dmg = cs.dmg },
     lanes = { e = 1e9, w = 1e9, s = 1e9, n = 1e9, wait = 1e9 } }
   pos = st.pos

@@ -18,7 +18,19 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
   POST /city/pause, /city/resume  (X-Key)   -> every turtle stops at a safe point / carries on
                                                (reports are answered "pause" while paused)
   POST /city/reset  (X-Key)                 -> forget all progress (for tests)
+  GET  /city/check?t=<label>&x=<x>          -> "check <steps>" (start the position check), "wait <s> <why>",
+                                               or "none" (no check configured)
+  GET  /city/check?t=<label>&x=&z=&e=       -> "ok" or "bad <why>": what the turtle found flying north
+                                               from its depot spot (e = down / front / none, z where)
 Coordinates on the wire are world coordinates. Inside, columns are city-local (origin = NW corner).
+
+Position check (for a repair of a pasted city, where a turtle that is a block off would dig the paste):
+env CHECK='{"y": 63, "rows": [[x0, x1, lastZ], ...]}' = the ground layer's y and, for x0..x1, the last z
+the paste reaches. On a first start a turtle flies north from its depot spot at home height, digging
+nothing, until there's ground under it, a block in front of it, or it has gone `steps`; this server
+says whether that is where it should have happened. It knows the paste edge and the blocks of finished
+jobs; while a job in front of the turtle is being built it says wait, and while a turtle checks, no
+job in front of it is handed out.
 """
 
 import json
@@ -45,6 +57,8 @@ DEPOT_X0 = int(os.environ.get("DEPOT_X0", "-858"))  # world x of slot 1
 DEPOT_STEP = int(os.environ.get("DEPOT_STEP", "8"))
 # The flying area beyond the city: a margin round it, and the depot strip along the south edge.
 MARGIN, SOUTH = 2, 24
+CHECK = json.loads(os.environ["CHECK"]) if os.environ.get("CHECK") else None   # the position check (see above)
+CHECK_HOLD = 900    # seconds a position check keeps jobs in front of the turtle from being handed out
 
 lock = threading.Lock()
 
@@ -76,7 +90,28 @@ class City:
                     elif line.startswith("L "):
                         break
         self.samples = []      # (time, blocks placed) once a minute, for the build rate
+        # for the position check: each job's blocks in the ground layer and the one above it, by column
+        self.checking = {}     # label -> (world x, since): turtles doing their position check
+        self.low = {}          # (world x, z) -> [(y, job)]
+        if CHECK:
+            gy = CHECK["y"]
+            for j in J["jobs"]:
+                for x, y, z in self.cells(j):
+                    if y in (gy, gy + 1):
+                        self.low.setdefault((x, z), []).append((y, j["id"]))
         self.load()
+
+    @staticmethod
+    def cells(j):
+        """A job's blocks, in world coordinates."""
+        y = None
+        with open(os.path.join(JOBS_DIR, j["file"])) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 2 and p[0] == "L":
+                    y = int(p[1])
+                elif y is not None and len(p) == 3:
+                    yield j["at"][0] + int(p[0]), j["at"][1] + y, j["at"][2] + int(p[1])
 
     # ---- grid helpers (city-local columns) ----
     def idx(self, x, z):
@@ -222,6 +257,8 @@ class City:
             j = self.jobs[jid]
             if jid in self.done or jid in held or j["kind"] == "water" or not self.ready(jid) or self.missing(jid, res):
                 continue
+            if self.in_check_strip(j):
+                continue
             ds = [dist[d] for d, _ in self.docks(j) if d in dist]
             if not ds:
                 continue
@@ -288,6 +325,83 @@ class City:
             self.lanes(),
             "route %s" % self.lane_route(route),
             "end"])
+
+    # ---- the position check ----
+    @staticmethod
+    def last_z(wx):
+        for x0, x1, z in CHECK["rows"]:
+            if x0 <= wx <= x1:
+                return z
+        return None
+
+    def strip(self, label, wx):
+        """The columns a checking turtle flies over (world x; z from the paste edge to its spot)."""
+        home, lz = self.homes.get(label), self.last_z(wx)
+        if not home or lz is None:
+            return None
+        return wx, lz + 1, home[2]
+
+    def hits(self, j, strip):
+        x0, z0, x1, z1 = self.box(j)
+        lx, lz0 = self.local(strip[0], strip[1])
+        _, lz1 = self.local(strip[0], strip[2])
+        return x0 <= lx <= x1 and z0 <= lz1 and z1 >= lz0
+
+    def in_check_strip(self, j):
+        now = time.time()
+        for label, (wx, since) in list(self.checking.items()):
+            if now - since > CHECK_HOLD:
+                del self.checking[label]
+                continue
+            s = self.strip(label, wx)
+            if s and self.hits(j, s):
+                return True
+        return False
+
+    def check_start(self, label, wx):
+        if not CHECK:
+            return "none"
+        home, s = self.homes.get(label), self.strip(label, wx)
+        if not home or not s or home[0] != wx:
+            return "wait 300 no position check for x %d (say hello first; is CHECK right?)" % wx
+        if home[1] != CHECK["y"] + 1:
+            return "wait 300 the depot is at y %d but CHECK says the ground is at y %d" % (home[1], CHECK["y"])
+        for c in self.claims.values():
+            if c["job"] not in self.done and self.hits(self.jobs[c["job"]], s):
+                return "wait 30 %s is being built in front of me; I'll check my position after that" % c["job"]
+        self.checking[label] = (wx, time.time())
+        return "check %d" % (home[2] - self.last_z(wx) + 2)
+
+    def expected(self, label, wx):
+        """What a turtle in the right spot finds flying north: ("down"|"front"|"none", z)."""
+        hx, hy, hz = self.homes[label]
+        lz = self.last_z(wx)
+        steps = hz - lz + 2
+
+        def solid(y, z):
+            if z <= lz:
+                return y == hy - 1      # the paste's ground layer (the air right above its edge is clear)
+            return any(yy == y and jid in self.done for yy, jid in self.low.get((wx, z), ()))
+        z, n = hz, 0
+        while True:
+            if n > 0 and solid(hy - 1, z):
+                return "down", z
+            if n >= steps:
+                return "none", z
+            if solid(hy, z - 1):
+                return "front", z
+            z, n = z - 1, n + 1
+
+    def check_result(self, label, wx, wz, e):
+        self.checking.pop(label, None)
+        if not CHECK or not self.strip(label, wx):
+            return "bad no position check is set up for me"
+        want = self.expected(label, wx)
+        if (e, wz) == want:
+            return "ok"
+        words = {"down": "ground under me at z %d", "front": "a block in front of me at z %d",
+                 "none": "nothing by z %d"}
+        return "bad I found %s, not %s." % (words.get(e, e + " at z %d") % wz, words[want[0]] % want[1])
 
     def finish(self, label, jid):
         c = self.claims.get(label)
@@ -371,6 +485,10 @@ class H(BaseHTTPRequestHandler):
                     city.homes[label] = home
                     city.save()
                     return self.reply(200, "home %d %d %d\n" % tuple(home))
+                if path == "/city/check":
+                    if "e" in q:
+                        return self.reply(200, city.check_result(q["t"], int(q["x"]), int(q["z"]), q["e"]) + "\n")
+                    return self.reply(200, city.check_start(q["t"], int(q["x"])) + "\n")
                 if path == "/city/next":
                     return self.reply(200, city.next(q["t"], int(q["x"]), int(q["y"]), int(q["z"])) + "\n")
                 if path.startswith("/city/plan/"):
