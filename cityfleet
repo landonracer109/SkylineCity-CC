@@ -24,11 +24,14 @@
 -- in x only across a step of the edge), so check each turtle's x with F3 too.
 -- With nothing to do (the server says wait) I wait up at the wait height, above everything the
 -- build places, straight up from where I finished, so I'm never in another turtle's way (v1.12).
+-- When the whole build is done and I'm home, I stop for good (v1.13): a later build, even on the same
+-- job server, only starts me again with "cityfleet <slot> go". The server can also tell me to stop
+-- ("stop": I wasn't started for the build it has now).
 -- Travelling, I fly at one height per direction (east, west, south, north each have their own lane
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.12"
+local VERSION = "v1.13"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -678,9 +681,11 @@ local function ask()
     sleep(tonumber(secs) or 30)
     return
   end
-  if head == "none" then
-    if lastMsg ~= "Nothing left to build. I'm home." then tell("Nothing left to build. I'm home.") end
-    sleep(300)
+  if head == "none" or head:match("^stop") then
+    -- finished (or not part of the build the server has now): stop here for good
+    local why = head == "none" and "Nothing left to build and I'm home, so I've stopped." or (head:match("^stop ?(.*)") or "")
+    st.phase, st.stopped = "stopped", why .. " Start me again with: cityfleet " .. cfg.slot .. " go"
+    save()
     return
   end
   local info = {}
