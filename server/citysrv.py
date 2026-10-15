@@ -2,7 +2,8 @@
 
 Plain-text answers so CC 1.63 can read them line by line. Only the standard library.
   GET  /city/hello?t=<label>&n=<slot>       -> "home x y z"  (the turtle's depot spot)
-  GET  /city/next?t=<label>&x=&y=&z=        -> a job + route, or "wait <s> <why>", or "home ..." + route, or "none"
+  GET  /city/next?t=<label>&x=&y=&z=        -> a job + route, or "wait <s> <why>", or "home ..." + route, or "none",
+                                               or "stop <why>" (that turtle never said hello to this build)
   GET  /city/plan/<job id>                  -> the job's build file
   GET  /city/done?t=<label>&job=<id>        -> "ok"
   POST /city/report?t=<label>               body: "key value" lines (job, cell, total, x, y, z, fuel, msg, need)
@@ -395,6 +396,10 @@ class City:
     def next(self, label, wx, wy, wz):
         if self.paused:
             return "wait 20 paused"
+        # Only turtles started for this build (they said hello to it) get work: one still running from
+        # an earlier build is told to stop (cityfleet v1.13; older ones just wait).
+        if label not in self.homes:
+            return "stop This job server has a new build that I wasn't started for."
         sx, sz = self.local(wx, wz)
         dist, route_to = self.ways(sx, sz)
         c = self.claims.get(label)

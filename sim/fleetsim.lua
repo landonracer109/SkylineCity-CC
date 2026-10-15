@@ -534,12 +534,23 @@ end
 
 -- LATE="n:seconds;...": turtle n is started that late (after others may have built in front of it)
 local LATE = {}
+-- STRAY="n,m": those turtles are left running from an earlier build (never say hello to this one)
+local STRAY = {}
+for n in (os.getenv("STRAY") or ""):gmatch("%d+") do STRAY[tonumber(n)] = true end
 for n, s in (os.getenv("LATE") or ""):gmatch("(%d+):(%d+)") do LATE[tonumber(n)] = tonumber(s) end
 for n = 1, N do
   local T = makeTurtle(n)
   T.clock = LATE[n] or 0
   while restartTimes[T.restartIdx + 1] and restartTimes[T.restartIdx + 1] <= T.clock do T.restartIdx = T.restartIdx + 1 end   -- (before it was started)
-  start(T, { tostring(n), SERVER, "go" })
+  if STRAY[n] then
+    -- left running from an earlier build: it never says hello to this one, it just carries on
+    T.files["cityfleet.cfg"] = textutils.serialize({ slot = n, label = "stray" .. n, server = SERVER })
+    T.files["fleet.state"] = textutils.serialize({ phase = "ask", pos = { x = T.x, y = T.y, z = T.z, f = 3 }, home = { x = T.x, y = T.y, z = T.z },
+      chest = { id = ENDER, dmg = n }, lanes = { e = 1e9, w = 1e9, s = 1e9, n = 1e9, wait = 1e9 } })
+    start(T, {})
+  else
+    start(T, { tostring(n), SERVER, "go" })
+  end
 end
 
 -- ---------- run ----------
