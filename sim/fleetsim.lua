@@ -12,6 +12,10 @@
 -- origin y). OFFSET="n:dx,dy,dz;..." puts turtle n that far off its depot spot (it doesn't know):
 -- its position check must stop it without digging anything. EARLY=n adds n server restarts in the
 -- first 2 minutes (during the position checks). LATE="n:seconds;..." starts turtle n that late.
+-- A zoned build (the metro): ONLY="e" checks only the jobs whose id starts with one of those letters;
+-- PREDONE (job ids) are built before the start (blocks placed, marked done on the server);
+-- ZONES_AUTO=1 opens the next zone (POST /zones) ZONE_DELAY s (default 300) after a turtle is first
+-- told to wait for one. DEPOT_ROW / DEPOT_ROWSTEP: the depot in rows (like citysrv).
 
 local JOBS, N, RESTARTS, SEED, HOURS = arg[1], tonumber(arg[2] or 4), tonumber(arg[3] or 3), tonumber(arg[4] or 1), tonumber(arg[5] or 30)
 local SERVER = os.getenv("SERVER") or "http://127.0.0.1:8097/city"
@@ -109,11 +113,15 @@ local function readPlan(file)
   end
   return p
 end
-local expected = {}
+local expected, allPlans = {}, {}
 do
   local p = io.popen(WIN and ('dir /b "' .. JOBS:gsub("/", "\\") .. '"') or ('ls "' .. JOBS .. '"'))
   for f in p:lines() do
-    if f:match("%.txt$") and f ~= "water.txt" and (not ONLY or f:sub(1, #ONLY) == ONLY) then expected[#expected + 1] = readPlan(JOBS .. "/" .. f) end
+    if f:match("%.txt$") and f ~= "water.txt" then
+      local q = readPlan(JOBS .. "/" .. f)
+      allPlans[#allPlans + 1] = q
+      if not ONLY or ONLY:find(f:sub(1, 1), 1, true) then expected[#expected + 1] = q end
+    end
   end
   p:close()
 end
@@ -124,7 +132,7 @@ local function key(x, y, z) return x .. "," .. y .. "," .. z end
 local ENDER, COALB = 801, 173
 local predone = {}
 for id in (os.getenv("PREDONE") or ""):gmatch("%S+") do predone[id] = true end
-for _, p in ipairs(expected) do if predone[p.id] then for _, c in ipairs(p.cells) do local m = p.mats[c[4]]; world[key(c[1], c[2], c[3])] = { id = m.id, dmg = m.dmg } end end end
+for _, p in ipairs(allPlans) do if predone[p.id] then for _, c in ipairs(p.cells) do local m = p.mats[c[4]]; world[key(c[1], c[2], c[3])] = { id = m.id, dmg = m.dmg } end end end
 local function at(x, y, z) return world[key(x, y, z)] end
 -- PLANTS=n: n plants (like HarvestCraft seaweed) floating at building-ground level across the city
 -- area and the depot strip. Turtles have to clear the ones in their way; none may be left.
@@ -153,6 +161,7 @@ local DX = { [0] = 1, 0, -1, 0 }
 local DZ = { [0] = 0, 1, 0, -1 }
 local turtles = {}
 local DEPOT_X0, DEPOT_STEP, DEPOT_Z = tonumber(os.getenv("DEPOT_X0") or -858), 8, tonumber(os.getenv("DEPOT_Z") or -200)
+local DEPOT_ROW, DEPOT_ROWSTEP = tonumber(os.getenv("DEPOT_ROW") or 0), tonumber(os.getenv("DEPOT_ROWSTEP") or 8)
 local GROUND
 do local f = io.open(JOBS .. "/jobs.json", "rb"); local jt = f:read("*a"); f:close(); GROUND = tonumber(jt:match('"origin"%s*:%s*%[%s*%-?%d+,%s*(%-?%d+)')) end
 local OFFSET = {}
@@ -184,12 +193,13 @@ local function stackTable(st, names) return st and { id = st.id, dmg = st.dmg, q
 
 local function makeTurtle(n)
   local o = OFFSET[n] or { 0, 0, 0 }
-  local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * (n - 1) + o[1], y = GROUND + o[2], z = DEPOT_Z + o[3], f = 3, digs = 0, fuel = 2500, sel = 1, inv = {},
-    clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
+  local row, col = 0, n - 1
+  if DEPOT_ROW > 0 then row, col = math.floor((n - 1) / DEPOT_ROW), (n - 1) % DEPOT_ROW end
+  local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * col + o[1], y = GROUND + o[2], z = DEPOT_Z + DEPOT_ROWSTEP * row + o[3], f = 3, digs = 0, fuel = 2500, sel = 1, inv = {},
+    clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, files = {}, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
   T.start = { T.x, T.y, T.z }
   if os.getenv("PASTE_JOBS") then world[key(T.x, T.y - 1, T.z)] = { id = 1, dmg = 0, pasted = true }; pasted = pasted + 1 end   -- its dock
   T.inv[16] = { id = ENDER, dmg = n, qty = 1 }
-  mkdir(T.dir)
   turtleAt[key(T.x, T.y, T.z)] = T
   turtles[n] = T
   return T
@@ -218,12 +228,11 @@ local function chestAbove(T) return chestAt(T, "top") end
 
 -- AE: keeps 2 stacks of each block in the turtle's current build file, and a stack of coal blocks
 local function aeFill(T)
-  local h = io.open(T.dir .. "/fleet.plan", "rb")
-  local stamp = h and h:read(400) or ""
-  if h then h:close() end
+  local plan = T.files["fleet.plan"] or ""
+  local stamp = plan:sub(1, 400)
   if stamp ~= T.planStamp then
     T.planStamp, T.planMats = stamp, {}
-    if stamp ~= "" then for line in io.lines(T.dir .. "/fleet.plan") do local id, dmg = line:match("^mat %d+ (%d+) (%d+)"); if id then T.planMats[#T.planMats + 1] = { tonumber(id), tonumber(dmg) } end; if line:match("^L ") then break end end end
+    for line in plan:gmatch("[^\n]+") do local id, dmg = line:match("^mat %d+ (%d+) (%d+)"); if id then T.planMats[#T.planMats + 1] = { tonumber(id), tonumber(dmg) } end; if line:match("^L ") then break end end
   end
   local inv = T.chest
   local want = { [COALB .. ":0"] = 64 }
@@ -290,6 +299,10 @@ local function envFor(T)
     local b = world[key(x, y, z)]
     if not b then return false end
     world[key(x, y, z)] = nil; stats.digs = stats.digs + 1; T.digs = T.digs + 1
+    if b.id == ENDER and b.dmg ~= T.n then
+      stats.chestsTaken = (stats.chestsTaken or 0) + 1
+      io.stderr:write(string.format("ENDER CHEST of t%d DUG by t%d at %d,%d,%d\n", b.dmg, T.n, x, y, z))
+    end
     if b.pasted then
       stats.pastedDigs = (stats.pastedDigs or 0) + 1
       if stats.pastedDigs <= 10 then io.stderr:write(string.format("PASTED BLOCK DUG by t%d at %d,%d,%d (%d:%d)\n", T.n, x, y, z, b.id, b.dmg)) end
@@ -415,19 +428,19 @@ local function envFor(T)
       return nil
     end,
   }
-  local function path(p) return T.dir .. "/" .. p end
+  local FS = T.files
   E.fs = {
-    exists = function(p) local h = io.open(path(p), "r"); if h then h:close(); return true end; return false end,
-    delete = function(p) os.remove(path(p)) end,
-    move = function(a, b) assert(os.rename(path(a), path(b))) end,
-    getSize = function(p) local h = io.open(path(p), "rb"); if not h then return 0 end; local n = h:seek("end"); h:close(); return n end,
+    exists = function(p) return FS[p] ~= nil end,
+    delete = function(p) FS[p] = nil end,
+    move = function(a, b) assert(FS[a], "no file " .. a); FS[b] = FS[a]; FS[a] = nil end,
+    getSize = function(p) return FS[p] and #FS[p] or 0 end,
     open = function(p, mode)
-      if mode == "a" then return { writeLine = function(s) local h = io.open(path(p), "ab"); h:write(s, "\n"); h:close() end, close = function() end } end
+      if mode == "a" then return { writeLine = function(s) FS[p] = (FS[p] or "") .. s .. "\n" end, close = function() end } end
       if mode == "w" then
         local buf = {}
         return { write = function(s) buf[#buf + 1] = s end, close = function()
           local text = table.concat(buf)
-          local h = io.open(path(p), "wb"); h:write(text); h:close()
+          FS[p] = text
           if p == "fleet.state" and not T.desynced then
             local st = textutils.unserialize(text)
             local q = st and st.pos
@@ -441,8 +454,15 @@ local function envFor(T)
           end
         end }
       end
-      local h = io.open(path(p), "rb"); if not h then return nil end
-      return { readLine = function() return h:read("*l") end, readAll = function() return h:read("*a") end, close = function() h:close() end }
+      local text = FS[p]; if not text then return nil end
+      local pos = 1
+      return { readLine = function()
+          if pos > #text then return nil end
+          local e = text:find("\n", pos, true)
+          local l = text:sub(pos, (e or #text + 1) - 1); pos = (e or #text) + 1
+          return l
+        end,
+        readAll = function() local r = text:sub(pos); pos = #text + 1; return r end, close = function() end }
     end,
   }
   local function resp(s) if not s or s == "" then return nil end; stats.http = stats.http + 1; return { readAll = function() return s end, close = function() end } end
@@ -481,6 +501,7 @@ local function envFor(T)
     T.log[#T.log + 1] = string.format("%8.0fs  %s", T.clock, s)
     if s:find("Nothing left to build") then T.finished = true end
     if s:find("Paused") then T.saidPaused = true end
+    if s:find("open the next zone", 1, true) and not zoneAsk then zoneAsk = T.clock end
     local bx, by, bz = s:match("in my way at (%-?%d+),(%-?%d+),(%-?%d+)")
     if bx and not T.toldBlock then
       T.toldBlock = true
@@ -504,9 +525,8 @@ textutils = { formatTime = function() return "12:00" end, serialize = ser, unser
 
 local prog = assert(loadfile(os.getenv("CITYFLEET") or "cityfleet"))
 local function start(T, runArgs)
-  local own = T.dir .. "/cityfleet"     -- an updated copy the turtle downloaded
-  local h = io.open(own, "r"); if h then h:close() end
-  local f = assert(loadfile(h and own or os.getenv("CITYFLEET") or "cityfleet"))
+  local own = T.files["cityfleet"]     -- an updated copy the turtle downloaded
+  local f = own and assert(loadstring(own, "cityfleet")) or assert(loadfile(os.getenv("CITYFLEET") or "cityfleet"))
   setfenv(f, envFor(T))
   T.boot = T.clock
   T.co = coroutine.create(function() return f(unpack(runArgs)) end)
@@ -533,6 +553,16 @@ local function postBody(path, body, key)
   return curl(string.format('-X POST %s --data-binary @%s/body2 "%s%s"', key and ('-H "X-Key: ' .. KEY .. '"') or "", DIR, SERVER, path))
 end
 local stuckSince = {}
+zoneAsk = nil
+local ZONES_AUTO, ZONE_DELAY, zoneLog = os.getenv("ZONES_AUTO") == "1", tonumber(os.getenv("ZONE_DELAY") or 300), {}
+local zonesOpen
+if ZONES_AUTO then
+  local f = io.open(JOBS .. "/jobs.json", "rb"); local jt = f:read("*a"); f:close()
+  local zs = jt:match('"zones"%s*:%s*(%b[])')
+  zonesOpen = {}
+  for k in zs:gmatch('"key"%s*:%s*"(%a+)"') do zonesOpen[#zonesOpen + 1] = k end
+  zoneAll, zoneN = zonesOpen, 1
+end
 local ended = "time limit"
 while true do
   local T
@@ -561,6 +591,16 @@ while true do
     local lines = {}
     for k in materials:gmatch("(%d+:%d+)") do lines[#lines + 1] = k .. " " .. ((STOCKOUT[k] and clock < STOCKBACK) and 0 or 1000000) end
     postBody("/stock", table.concat(lines, "\n") .. "\n")
+  end
+  if ZONES_AUTO and zoneAsk and clock >= zoneAsk + ZONE_DELAY and zoneN < #zoneAll then
+    zoneN = zoneN + 1
+    local open = {}
+    for i = 1, zoneN do open[#open + 1] = zoneAll[i] end
+    assert(postBody("/zones", table.concat(open, " "), true):match("^open"), "zones refused")
+    zoneLog[#zoneLog + 1] = string.format("%s opened at %.2f h (asked %.2f h, %d placed)", zoneAll[zoneN], clock / 3600, zoneAsk / 3600, stats.places)
+    io.stderr:write(zoneLog[#zoneLog] .. "\n")
+    zoneAsk = nil
+    for _, t in ipairs(turtles) do t.zoneHint = nil end
   end
   if clock > deadline then break end
   local done = true
@@ -593,12 +633,13 @@ end
 -- ---------- check ----------
 local want, missing, wrong, extra, total = {}, 0, 0, 0, 0
 local missingBy = {}
+for _, p in ipairs(allPlans) do for _, c in ipairs(p.cells) do want[key(c[1], c[2], c[3])] = true end end
 for _, p in ipairs(expected) do
   for _, c in ipairs(p.cells) do
     total = total + 1
     local k = key(c[1], c[2], c[3]); want[k] = true
     local b, m = world[k], p.mats[c[4]]
-    if not b then missing = missing + 1; missingBy[p.id] = (missingBy[p.id] or 0) + 1
+    if not b then missing = missing + 1; missingBy[p.id] = (missingBy[p.id] or 0) + 1; if missing <= 5 then io.write("  missing at ", k, " ", m.id, ":", m.dmg, " (", p.id, ")\n") end
     elseif b.id ~= m.id or b.dmg ~= m.dmg then wrong = wrong + 1; if wrong <= 5 then io.write("  wrong at ", k, " have ", b.id, ":", b.dmg, " want ", m.id, ":", m.dmg, " (", p.id, ")\n") end end
   end
 end
@@ -636,16 +677,17 @@ if next(STOCKOUT) then
   for _, T in ipairs(turtles) do for _, l in ipairs(T.log) do if l:find("needs") then stuck = stuck + 1 end end end
   io.write(string.format("Ender Chest waits logged (\"needs ...\"): %d\n", stuck))
 end
+for _, l in ipairs(zoneLog) do io.write("zone ", l, "\n") end
 io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
 if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
 if relV then
   local n = 0
   for _, t in ipairs(turtles) do
-    local h = io.open(t.dir .. "/cityfleet", "r")
-    if h then if h:read("*a"):find('VERSION = "' .. relV .. '"', 1, true) then n = n + 1 end; h:close() end
+    if t.files["cityfleet"] and t.files["cityfleet"]:find('VERSION = "' .. relV .. '"', 1, true) then n = n + 1 end
   end
   io.write(string.format("release %s: %d of %d turtles updated (%d downloads)\n", relV, n, #turtles, stats.downloads or 0))
 end
+io.write(string.format("Ender Chests of other turtles dug: %d\n", stats.chestsTaken or 0))
 io.write(string.format("Ender Chests put in front (top of the world): %d   torch placements refused: %d\n", stats.frontChests or 0, stats.torchFails or 0))
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
   stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))
