@@ -90,6 +90,11 @@ button.pause.on { background: var(--building); color: #1b1305; border-color: var
         <h2>Supply</h2>
         <div id="supply" class="msg">no word from the supply computer yet</div>
       </section>
+      <section class="panel" id="zonesPanel" hidden>
+        <h2>Zones</h2>
+        <div class="kinds" id="zones"></div>
+        <p class="msg" id="zoneHint"></p>
+      </section>
       <section class="panel">
         <h2>By kind</h2>
         <div class="kinds" id="kinds"></div>
@@ -99,7 +104,8 @@ button.pause.on { background: var(--building); color: #1b1305; border-color: var
 </main>
 <div id="tip"></div>
 <script>
-const KIND = { ground: "Platform", street: "Streets", tower: "Buildings", park: "Parks", water: "Water" };
+const KIND = { ground: "Platform", street: "Streets", tower: "Buildings", park: "Parks", water: "Water", highway: "Highways", building: "Buildings",
+  structure: "Structures", bridge: "Bridges", tour: "Skyline Tour", sign: "Sign gantries", torch: "Magnum Torches" };
 const PHASE = { ask: "between jobs", go: "flying to", build: "building", leave: "leaving", home: "flying home", supply: "supply" };
 const fmt = n => n == null ? "–" : Math.round(n).toLocaleString("en-US");
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
@@ -171,7 +177,21 @@ function render() {
   }).join("") || `<tr><td colspan="5" class="msg">no turtles have reported yet</td></tr>`;
   const sup = S.reports.supply;
   document.getElementById("supply").innerHTML = sup ? `<span class="${sup.age > 180 ? "late" : ""}">${esc(niceNeed(sup.msg || ""))}</span> <span class="msg">· ${ago(sup.age)} ago</span>` : "no word from the supply computer yet";
-  document.getElementById("kinds").innerHTML = ["ground", "street", "tower", "park"].filter(k => S.kinds[k]).map(k => {
+  if (S.zones && S.zones.length) {
+    document.querySelector("h1").textContent = "Skyline Metro";
+    document.getElementById("zonesPanel").hidden = false;
+    const next = S.zones.find(z => !z.open && z.done < z.jobs);
+    document.getElementById("zones").innerHTML = S.zones.map(z => {
+      const p = z.blocks ? 100 * z.placed / z.blocks : 0;
+      const tag = z.open ? "open" : (z === next ? `<button class="pause" data-zone="${z.key}">Open</button>` : "closed");
+      return `<div class="row"><span>${esc(z.name)}</span><div class="bar"><i style="width:${p.toFixed(1)}%"></i></div><span>${z.done}/${z.jobs} jobs · ${tag}</span></div>`;
+    }).join("");
+    const open = S.zones.filter(z => z.open), left = open.reduce((a, z) => a + z.jobs - z.done, 0);
+    document.getElementById("zoneHint").textContent = next ? (left < 40 ? `Load the chunks of ${next.name}, then open it: the open zones are nearly done (${left} jobs left).` :
+      `Next: ${next.name}. Open it once its chunks are loaded.`) : "Every zone is open.";
+  }
+  const order = ["ground", "street", "tower", "building", "highway", "bridge", "tour", "structure", "sign", "park", "torch"];
+  document.getElementById("kinds").innerHTML = order.filter(k => S.kinds[k]).map(k => {
     const e = S.kinds[k], p = e.blocks ? 100 * e.placed / e.blocks : 0;
     return `<div class="row"><span>${KIND[k]}</span><div class="bar"><i style="width:${p.toFixed(1)}%"></i></div><span>${e.done}/${e.jobs} jobs</span></div>`;
   }).join("");
@@ -194,6 +214,22 @@ async function togglePause() {
   load();
 }
 document.getElementById("pauseBtn").addEventListener("click", togglePause);
+// Open the next zone (same password)
+document.getElementById("zones").addEventListener("click", async ev => {
+  const b = ev.target.closest("button[data-zone]"); if (!b || !S) return;
+  const want = S.zones.filter(z => z.open).map(z => z.key).concat(b.dataset.zone).join(" ");
+  if (!confirm("Open " + S.zones.find(z => z.key === b.dataset.zone).name + "? Its chunks must be loaded first.")) return;
+  let key = null;
+  try { key = localStorage.getItem("cityKey"); } catch (e) {}
+  for (let tries = 0; tries < 2; tries++) {
+    if (!key) { key = prompt("Password:"); if (!key) return; }
+    const r = await fetch(location.pathname.replace(/\/$/, "") + "/zones", { method: "POST", headers: { "X-Key": key }, body: want });
+    if (r.status === 403) { try { localStorage.removeItem("cityKey"); } catch (e) {} key = null; alert("Wrong password."); continue; }
+    try { localStorage.setItem("cityKey", key); } catch (e) {}
+    break;
+  }
+  load();
+});
 
 async function load() {
   try {
@@ -210,7 +246,7 @@ document.getElementById("map").addEventListener("mousemove", ev => {
   const x = (ev.clientX - r.left) * k, y = (ev.clientY - r.top) * k;
   const b = boxes.slice().reverse().find(b => x >= b.X && x <= b.X + b.w && y >= b.Y && y <= b.Y + b.d);
   if (!b) { tip.style.display = "none"; return; }
-  const st = { done: "built", building: "being built by " + b.who, ready: "ready to start", waiting: "waiting for the platform/streets",
+  const st = { done: "built", building: "being built by " + b.who, ready: "ready to start", waiting: "waiting for other jobs",
     nostock: "AE is short of " + (b.short || []).join(", ") }[b.state];
   tip.innerHTML = `<b>${esc(b.name)}</b><br>${b.h} tall, ${fmt(b.blocks)} blocks<br>${st}${b.state === "building" ? ` (${Math.floor(100 * b.placed / b.blocks)}%)` : ""}`;
   tip.style.display = "block"; tip.style.left = (ev.clientX + 14) + "px"; tip.style.top = (ev.clientY + 14) + "px";

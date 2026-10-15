@@ -24,6 +24,18 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
                                                from its depot spot (e = down / front / none, z where)
 Coordinates on the wire are world coordinates. Inside, columns are city-local (origin = NW corner).
 
+  POST /city/zones   (X-Key)  body "east north" -> the zones (of a zoned build) turtles may work in, in order
+
+A zoned build (Skyline Metro: jobs.json with "zones", "lanes" and "topAbs"): every job has a zone, and
+only zones that are open get turtles (open the next one once its chunks are loaded); a turtle gets
+work from the first open zone that has a job ready, so nobody idles while another open zone has work.
+Jobs list their own docks (checked by the exporter), the jobs they wait for ("after"), the jobs never
+to be built at the same time ("excl": their turtles' paths cross) and "prio" (blocks on the longest
+chain of jobs that wait on it: those go first). The lanes are given as world heights above everything
+the build places; columns taller than the lowest lane (downtown's towers) are flown round. Routes are
+straight runs: an L if one is clear, else a search that avoids turns.
+Depot: DEPOT_ROW slots per row (0 = one row), rows DEPOT_ROWSTEP blocks apart in z.
+
 Position check (for a repair of a pasted city, where a turtle that is a block off would dig the paste):
 env CHECK='{"y": 63, "rows": [[x0, x1, lastZ], ...]}' = the ground layer's y and, for x0..x1, the last z
 the paste reaches. On a first start a turtle flies north from its depot spot at home height, digging
@@ -33,6 +45,7 @@ jobs; while a job in front of the turtle is being built it says wait, and while 
 job in front of it is handed out.
 """
 
+import heapq
 import json
 import re
 import os
@@ -55,6 +68,8 @@ WAIT_ABOVE = LANE_HIGH + 1      # a turtle that has to wait gets out of the lane
 DEPOT_Z = int(os.environ.get("DEPOT_Z", "-200"))   # world z of the depot row
 DEPOT_X0 = int(os.environ.get("DEPOT_X0", "-858"))  # world x of slot 1
 DEPOT_STEP = int(os.environ.get("DEPOT_STEP", "8"))
+DEPOT_ROW = int(os.environ.get("DEPOT_ROW", "0"))           # slots per row (0: all in one row)
+DEPOT_ROWSTEP = int(os.environ.get("DEPOT_ROWSTEP", "8"))   # z from one row to the next
 # The flying area beyond the city: a margin round it, and the depot strip along the south edge.
 MARGIN, SOUTH = 2, 24
 CHECK = json.loads(os.environ["CHECK"]) if os.environ.get("CHECK") else None   # the position check (see above)
@@ -72,16 +87,32 @@ class City:
         self.jobs = {j["id"]: j for j in J["jobs"]}
         self.order = [j["id"] for j in J["jobs"]]
         top = [[int(v, 36) for v in row.split(",")] for row in J["colTop"]]
-        # the flying grid: x -MARGIN..spanX-1+MARGIN, z -MARGIN..spanZ-1+SOUTH
+        # zoned build (the metro): world heights for the lanes, column tops as world y + 1
+        self.metro = bool(J.get("topAbs"))
+        if self.metro:
+            L = J["lanes"]
+            self.laneY = {k: L[k] for k in ("+x", "-x", "+z", "-z")}
+            self.waitY, self.flyMax = L["wait"], min(self.laneY.values())
+            south = MARGIN
+        else:
+            self.laneY = {k: self.O[1] + v for k, v in LANES.items()}
+            self.waitY, self.flyMax = self.O[1] + WAIT_ABOVE, LANE_LOW
+            south = SOUTH
+        self.zones = [z["key"] for z in J.get("zones", [])]
+        self.zoneNames = {z["key"]: z["name"] for z in J.get("zones", [])}
+        # the flying grid: x -MARGIN..spanX-1+MARGIN, z -MARGIN..spanZ-1+south
         self.gx0, self.gz0 = -MARGIN, -MARGIN
-        self.gw, self.gd = self.spanX + 2 * MARGIN, self.spanZ + MARGIN + SOUTH
+        self.gw, self.gd = self.spanX + 2 * MARGIN, self.spanZ + MARGIN + south
         self.top = bytearray(self.gw * self.gd)      # 0 outside the city
         for z in range(self.spanZ):
             for x in range(self.spanX):
                 self.top[self.idx(x, z)] = min(255, top[z][x])
         # readable block names, from the build files ("id:dmg" -> name), for the web page
         self.names = {}
-        for j in J["jobs"]:
+        if J.get("names"):
+            used = {k for j in J["jobs"] for k in j["need"]}
+            self.names = {k: J["names"].get(k, k) for k in used}
+        for j in ([] if self.names else J["jobs"]):
             with open(os.path.join(JOBS_DIR, j["file"])) as f:
                 for line in f:
                     if line.startswith("mat "):
@@ -121,7 +152,7 @@ class City:
         return self.gx0 <= x < self.gx0 + self.gw and self.gz0 <= z < self.gz0 + self.gd
 
     def flyable(self, x, z):
-        return self.inside(x, z) and self.top[self.idx(x, z)] <= LANE_LOW
+        return self.inside(x, z) and self.top[self.idx(x, z)] <= self.flyMax
 
     def empty(self, x, z):
         return self.inside(x, z) and self.top[self.idx(x, z)] == 0
@@ -151,6 +182,8 @@ class City:
         self.stock = s.get("stock", {})          # "id:dmg" -> how many AE has (from the supply computer)
         self.stockAt = s.get("stockAt", 0)
         self.release = s.get("release")          # {"v": "v1.11", "commit": sha}: turtles update to it
+        dflt = [z for z in os.environ.get("ZONES", "").replace(",", " ").split() if z in self.zones] or self.zones[:1]
+        self.zonesOpen = [z for z in s.get("zonesOpen", dflt) if z in self.zones]   # zoned build: where turtles may work
 
     def save(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -158,7 +191,8 @@ class City:
         with open(tmp, "w") as f:
             json.dump({"done": sorted(self.done), "claims": self.claims, "homes": self.homes,
                        "reports": self.reports, "doneAt": self.doneAt, "paused": self.paused,
-                       "stock": self.stock, "stockAt": self.stockAt, "release": self.release}, f)
+                       "stock": self.stock, "stockAt": self.stockAt, "release": self.release,
+                       "zonesOpen": self.zonesOpen}, f)
         os.replace(tmp, self.path())
 
     # ---- routing ----
@@ -197,12 +231,84 @@ class City:
         path.reverse()
         return self.corners(path)
 
+    def clear_run(self, x0, z0, x1, z1, xfirst=True):
+        """Every column from (x0, z0) to (x1, z1), along x then z (or z then x), the start left out,
+        can be flown over."""
+        x, z = x0, z0
+        for axis in ("xz" if xfirst else "zx"):
+            if axis == "x":
+                while x != x1:
+                    x += 1 if x1 > x else -1
+                    if not self.flyable(x, z):
+                        return False
+            else:
+                while z != z1:
+                    z += 1 if z1 > z else -1
+                    if not self.flyable(x, z):
+                        return False
+        return True
+
+    def find_route(self, sx, sz, tx, tz, turn=12, limit=600000):
+        """Corner columns of a way over flyable columns: an L if one is clear, else the cheapest path
+        with a cost for every turn (each turn is a change of lane). None if there is none."""
+        if (sx, sz) == (tx, tz):
+            return []
+        straight = sx == tx or sz == tz
+        if self.clear_run(sx, sz, tx, tz, True):
+            return [(tx, tz)] if straight else [(tx, sz), (tx, tz)]
+        if not straight and self.clear_run(sx, sz, tx, tz, False):
+            return [(sx, tz), (tx, tz)]
+        if not self.flyable(tx, tz):
+            return None
+        D = ((1, 0), (0, 1), (-1, 0), (0, -1))
+        best, par, q = {}, {}, []
+        for d in range(4):
+            best[(sx, sz, d)] = 0
+            heapq.heappush(q, (abs(sx - tx) + abs(sz - tz), 0, sx, sz, d))
+        n, end = 0, None
+        while q and n < limit:
+            f, g, x, z, d = heapq.heappop(q)
+            if g > best.get((x, z, d), 1 << 30):
+                continue
+            if (x, z) == (tx, tz):
+                end = (x, z, d)
+                break
+            n += 1
+            for nd in range(4):
+                if nd == (d + 2) % 4:
+                    continue
+                nx, nz = x + D[nd][0], z + D[nd][1]
+                if not self.flyable(nx, nz):
+                    continue
+                ng = g + 1 + (turn if nd != d and (x, z) != (sx, sz) else 0)
+                k = (nx, nz, nd)
+                if ng < best.get(k, 1 << 30):
+                    best[k], par[k] = ng, (x, z, d)
+                    heapq.heappush(q, (ng + abs(nx - tx) + abs(nz - tz), ng, nx, nz, nd))
+        if not end:
+            return None
+        path = [end]
+        while (path[-1][0], path[-1][1]) != (sx, sz):
+            path.append(par[path[-1]])
+        return self.corners([(x, z) for x, z, _ in reversed(path)])
+
+    def ways(self, sx, sz):
+        """(distance to a column, or None if it can't be reached; route to a column, or None) from (sx, sz)."""
+        if self.metro:
+            return (lambda c: abs(c[0] - sx) + abs(c[1] - sz)), (lambda c: self.find_route(sx, sz, *c))
+        dist, par = self.bfs(sx, sz)
+        return dist.get, (lambda c: (self.route_to(par, sx, sz, *c) if c != (sx, sz) else []) if c in dist else None)
+
     def box(self, j):
         x0, z0 = self.local(j["at"][0], j["at"][2])
         return x0, z0, x0 + j["size"][0] - 1, z0 + j["size"][2] - 1
 
     def docks(self, j):
         """Empty columns next to the job's box (not corners), with the box column each one faces."""
+        if "docks" in j:
+            taken = {tuple(c["dock"]) for c in self.claims.values() if c.get("dock")}
+            homes = {self.local(h[0], h[2]) for h in self.homes.values()}
+            return [((dx, dz), (nx, nz)) for dx, dz, nx, nz in j["docks"] if (dx, dz) not in taken and (dx, dz) not in homes]
         x0, z0, x1, z1 = self.box(j)
         out = []
         for x in range(x0, x1 + 1):
@@ -245,6 +351,13 @@ class City:
             reserved = self.reserved()
         return [k for k, n in self.jobs[jid]["need"].items() if k in self.stock and self.stock[k] - reserved.get(k, 0) < n]
 
+    def zone_ok(self, j):
+        return not self.zones or j.get("zone") in self.zonesOpen
+
+    def blocked(self, j, held):
+        """A job whose turtle's path crosses one being built now waits."""
+        return any(e in held and e not in self.done for e in j.get("excl", ()))
+
     def pick(self, label, sx, sz, dist):
         """The job to give this turtle: platform tiles first (everything waits on them), then street
         tiles (towers wait on them), then the biggest ready building, so the last hours aren't one
@@ -257,20 +370,24 @@ class City:
             j = self.jobs[jid]
             if jid in self.done or jid in held or j["kind"] == "water" or not self.ready(jid) or self.missing(jid, res):
                 continue
-            if self.in_check_strip(j):
+            if self.in_check_strip(j) or not self.zone_ok(j) or self.blocked(j, held):
                 continue
-            ds = [dist[d] for d, _ in self.docks(j) if d in dist]
+            ds = [x for x in (dist(d) for d, _ in self.docks(j)) if x is not None]
             if not ds:
                 continue
-            rank = {"ground": 0, "street": 1}.get(j["kind"], 2)
-            key = (rank, -j["blocks"] if rank == 2 else 0, min(ds))
+            if self.zones:
+                # the first open zone with work, then the longest chain of waiting jobs, then the nearest
+                key = (self.zonesOpen.index(j["zone"]), -j.get("prio", j["blocks"]), min(ds))
+            else:
+                rank = {"ground": 0, "street": 1}.get(j["kind"], 2)
+                key = (rank, -j["blocks"] if rank == 2 else 0, min(ds))
             if bestKey is None or key < bestKey:
                 best, bestKey = jid, key
         return best
 
     def lanes(self):
-        y = self.O[1]
-        return "lanes %d %d %d %d %d" % (y + LANES["+x"], y + LANES["-x"], y + LANES["+z"], y + LANES["-z"], y + WAIT_ABOVE)
+        L = self.laneY
+        return "lanes %d %d %d %d %d" % (L["+x"], L["-x"], L["+z"], L["-z"], self.waitY)
 
     def lane_route(self, corners):
         return " ".join("%d,%d" % self.world(x, z) for x, z in corners)
@@ -279,7 +396,7 @@ class City:
         if self.paused:
             return "wait 20 paused"
         sx, sz = self.local(wx, wz)
-        dist, par = self.bfs(sx, sz)
+        dist, route_to = self.ways(sx, sz)
         c = self.claims.get(label)
         if c and c["job"] not in self.done:
             jid = c["job"]
@@ -290,6 +407,15 @@ class City:
             jid = self.pick(label, sx, sz, dist)
             if not jid:
                 left = [k for k in self.order if k not in self.done and self.jobs[k]["kind"] != "water"]
+                hint = ""
+                if self.zones:
+                    closed = [k for k in left if not self.zone_ok(self.jobs[k])]
+                    left = [k for k in left if self.zone_ok(self.jobs[k])]
+                    if closed:
+                        nxt = next(z for z in self.zones if z not in self.zonesOpen and any(self.jobs[k]["zone"] == z for k in closed))
+                        hint = "; open the next zone (%s) once its chunks are loaded" % self.zoneNames.get(nxt, nxt)
+                        if not left:
+                            return "wait 60 the open zones are done" + hint
                 if left:
                     busy = sum(1 for k in left if k in {c["job"] for c in self.claims.values()})
                     res = self.reserved()
@@ -297,24 +423,25 @@ class City:
                     if short:
                         return "wait 60 %d jobs left, %d being built; the rest wait for blocks AE is short of: %s" % (
                             len(left), busy, ", ".join(self.names.get(k, k) for k in short))
-                    return "wait 30 %d jobs left, %d being built, the rest wait for them" % (len(left), busy)
+                    return "wait 30 %d jobs left, %d being built, the rest wait for them%s" % (len(left), busy, hint)
                 home = self.homes.get(label)
                 if not home:
                     return "none"
                 hx, hz = self.local(home[0], home[2])
                 if (sx, sz) == (hx, hz):
                     return "none"
-                if (hx, hz) not in dist:
+                r = route_to((hx, hz))
+                if r is None:
                     return "wait 60 no way home from here"
-                return "home %d %d %d\n%s\nroute %s\nend" % (home[0], home[1], home[2], self.lanes(), self.lane_route(self.route_to(par, sx, sz, hx, hz)))
+                return "home %d %d %d\n%s\nroute %s\nend" % (home[0], home[1], home[2], self.lanes(), self.lane_route(r))
             j = self.jobs[jid]
-            dock, enter = min(((d, e) for d, e in self.docks(j) if d in dist), key=lambda de: dist[de[0]])
+            dock, enter = min(((d, e) for d, e in self.docks(j) if dist(d) is not None), key=lambda de: dist(de[0]))
             self.claims[label] = {"job": jid, "dock": list(dock), "enter": list(enter), "since": time.time()}
             self.save()
         j = self.jobs[jid]
-        if dock not in dist:
+        route = route_to(dock)
+        if route is None:
             return "wait 60 no way to %s from here" % jid
-        route = self.route_to(par, sx, sz, *dock) if dock != (sx, sz) else []
         dwx, dwz = self.world(*dock)
         ewx, ewz = self.world(*enter)
         return "\n".join([
@@ -423,10 +550,12 @@ class City:
             if jid in self.done:
                 e["done"] += 1
                 e["placed"] += self.jobs[jid]["blocks"]
+        placing = {}
         for label, r in self.reports.items():
             c = self.claims.get(label)
             if c and c["job"] not in self.done and r.get("job") == c["job"]:
-                kinds[self.jobs[c["job"]]["kind"]]["placed"] += max(0, int(r.get("cell", 1)) - 1)
+                placing[c["job"]] = max(0, int(r.get("cell", 1)) - 1)
+                kinds[self.jobs[c["job"]]["kind"]]["placed"] += placing[c["job"]]
         now = time.time()
         reports = {k: dict(r, age=int(now - r.get("at", now))) for k, r in self.reports.items()}
         # each job: id, kind, name, box (city-local x0 z0 x1 z1), blocks, height, state, placed
@@ -452,7 +581,14 @@ class City:
             self.samples = [p for p in self.samples if now - p[0] <= 600]
         old = self.samples[0]
         rate = (placed - old[1]) / (now - old[0]) * 3600 if now - old[0] >= 120 else None
-        return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": LANES,
+        zones = []
+        for z in self.zones:
+            ids = [k for k in self.order if self.jobs[k].get("zone") == z]
+            zones.append({"key": z, "name": self.zoneNames.get(z, z), "open": z in self.zonesOpen, "jobs": len(ids),
+                          "done": sum(1 for k in ids if k in self.done), "blocks": sum(self.jobs[k]["blocks"] for k in ids),
+                          "placed": sum(self.jobs[k]["blocks"] for k in ids if k in self.done) +
+                          sum(p for k, p in placing.items() if self.jobs[k].get("zone") == z)})
+        return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": self.laneY, "zones": zones,
                 "doneCount": len(self.done), "jobCount": len(self.order), "jobs": jobs, "names": self.names,
                 "origin": self.O, "span": [self.spanX, self.spanZ], "placed": placed, "rate": rate,
                 "paused": self.paused, "release": self.release, "stockAge": int(now - self.stockAt) if self.stockAt else None}
@@ -481,7 +617,8 @@ class H(BaseHTTPRequestHandler):
             with lock:
                 if path == "/city/hello":
                     label, n = q["t"], int(q["n"])
-                    home = [DEPOT_X0 + DEPOT_STEP * (n - 1), city.O[1], DEPOT_Z]
+                    row, col = divmod(n - 1, DEPOT_ROW) if DEPOT_ROW else (0, n - 1)
+                    home = [DEPOT_X0 + DEPOT_STEP * col, city.O[1], DEPOT_Z + DEPOT_ROWSTEP * row]
                     city.homes[label] = home
                     city.save()
                     return self.reply(200, "home %d %d %d\n" % tuple(home))
@@ -561,6 +698,16 @@ class H(BaseHTTPRequestHandler):
                 city.release = {"v": parts[0], "commit": parts[1]}
                 city.save()
                 return self.reply(200, "release %s %s\n" % (parts[0], parts[1]))
+            if path == "/city/zones":
+                if not KEY or self.headers.get("X-Key") != KEY:
+                    return self.reply(403, "wrong password\n")
+                want = body.replace(",", " ").split()
+                bad = [z for z in want if z not in city.zones]
+                if bad or not want:
+                    return self.reply(400, "zones: %s\n" % " ".join(city.zones))
+                city.zonesOpen = want
+                city.save()
+                return self.reply(200, "open %s\n" % " ".join(want))
             if path in ("/city/pause", "/city/resume"):
                 if not KEY or self.headers.get("X-Key") != KEY:
                     return self.reply(403, "wrong password\n")
