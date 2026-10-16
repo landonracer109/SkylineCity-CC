@@ -102,12 +102,17 @@ end
 reset()
 
 -- ---------- what should be built (every job file) ----------
+-- (sign gantries: a floppy "cell" is the floppy for the drive at that spot, with the text of the "sign"
+-- line after it; it's checked on its own, not as a block)
+local FLOPPY = 5883
 local function readPlan(file)
-  local p = { mats = {}, cells = {} }
+  local p = { mats = {}, cells = {}, disks = {} }
   local y, at = 0, nil
   for line in io.lines(file) do
-    local a, b, c = line:match("^(%-?%d+) (%-?%d+) (%d+)$")
-    if a then p.cells[#p.cells + 1] = { tonumber(a) + at[1], y + at[2], tonumber(b) + at[3], tonumber(c) }
+    local a, b, c = line:match("^(%-?%d+) (%-?%d+) (%d+) ?[0-3]?$")
+    if a and p.mats[tonumber(c)].id == FLOPPY then p.disks[#p.disks + 1] = { tonumber(a) + at[1], y + at[2], tonumber(b) + at[3] }
+    elseif a then p.cells[#p.cells + 1] = { tonumber(a) + at[1], y + at[2], tonumber(b) + at[3], tonumber(c) }
+    elseif line:match("^sign ") then p.disks[#p.disks].text = line:sub(6)
     else
       local cmd, rest = line:match("^(%S+)%s*(.*)$")
       if cmd == "L" then y = tonumber(rest)
@@ -194,13 +199,13 @@ if os.getenv("PASTE_JOBS") then
   io.stderr:write(string.format("pasted city: %d blocks\n", pasted))
 end
 
+-- CHUNKLOG=<file>: every chunk a turtle moved into, written at the end ("cx cz" lines)
+CHUNKS = os.getenv("CHUNKLOG") and {} or nil
 local function stackTable(st, names) return st and { id = st.id, dmg = st.dmg, qty = st.qty, name = "x", rawName = "x" } or nil end
 
 local function makeTurtle(n)
   local o = OFFSET[n] or { 0, 0, 0 }
   local row, col = 0, n - 1
--- CHUNKLOG=<file>: every chunk a turtle moved into, written at the end ("cx cz" lines)
-CHUNKS = os.getenv("CHUNKLOG") and {} or nil
   if DEPOT_ROW > 0 then row, col = math.floor((n - 1) / DEPOT_ROW), (n - 1) % DEPOT_ROW end
   local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * col + o[1], y = GROUND + o[2], z = DEPOT_Z + DEPOT_ROWSTEP * row + o[3], f = 3, digs = 0, fuel = 2500, sel = 1, inv = {},
     clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, files = {}, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
@@ -295,12 +300,12 @@ local function envFor(T)
     T.fuel = T.fuel - 1; T.x, T.y, T.z = x, y, z; stats.moves = stats.moves + 1
     trace("moved " .. dir .. (kill and " (answer lost)" or "")); T.acts = (T.acts or 0) + 1
     turtleAt[key(x, y, z)] = T
+    if CHUNKS then CHUNKS[(zoneAll and zoneAll[zoneN] or "all") .. " " .. math.floor(x / 16) .. " " .. math.floor(z / 16)] = true end
     if kill then stats.lostMoves = stats.lostMoves + 1; coroutine.yield("KILL") end   -- moved, but the answer is lost
     return true
   end
   local function simple(dt) if restartDue(T) then coroutine.yield("KILL") end; act(T, dt) end
   local function detect(dir) simple(.05); local x, y, z = target(dir); return at(x, y, z) ~= nil or turtleAt[key(x, y, z)] ~= nil end
-    if CHUNKS then CHUNKS[(zoneAll and zoneAll[zoneN] or "all") .. " " .. math.floor(x / 16) .. " " .. math.floor(z / 16)] = true end
   local function dig(dir)
     simple(.4)
     local x, y, z = target(dir)
@@ -310,6 +315,10 @@ local function envFor(T)
     if b.id == ENDER and b.dmg ~= T.n then
       stats.chestsTaken = (stats.chestsTaken or 0) + 1
       io.stderr:write(string.format("ENDER CHEST of t%d DUG by t%d at %d,%d,%d\n", b.dmg, T.n, x, y, z))
+    end
+    if b.disk then
+      stats.disksDug = (stats.disksDug or 0) + 1
+      io.stderr:write(string.format("DISK DRIVE WITH FLOPPY DUG by t%d at %d,%d,%d\n", T.n, x, y, z))
     end
     if b.pasted then
       stats.pastedDigs = (stats.pastedDigs or 0) + 1
@@ -385,6 +394,20 @@ local function envFor(T)
       end
       T.inv[T.sel] = nil; return true
     end,
+    dropDown = function()
+      simple(.05)
+      local st = T.inv[T.sel]; if not st then return false end
+      local x, y, z = target("down")
+      local b = at(x, y, z)
+      if b and b.id == 765 and b.dmg == 0 then
+        if b.disk then return false end
+        if st.id ~= FLOPPY then return false end
+        b.disk = { files = {} }
+        st.qty = st.qty - 1; if st.qty == 0 then T.inv[T.sel] = nil end
+        return true
+      end
+      T.inv[T.sel] = nil; return true
+    end,
     dropUp = function()
       simple(.05)
       local st = T.inv[T.sel]; if not st then return false end
@@ -433,8 +456,22 @@ local function envFor(T)
       if turtleAt[key(x, y, z)] then return "turtle" end
       local b = at(x, y, z)
       if b and b.id == ENDER then return "ender_chest" end
+      if b and b.id == 765 then return b.dmg == 0 and "drive" or b.dmg == 4 and "monitor" or nil end
+      if b and b.id == 764 then return "computer" end
       return nil
     end,
+    call = function(side, method)
+      simple(.05)
+      local x, y, z = target(side == "top" and "up" or side == "bottom" and "down" or "forward")
+      local b = at(x, y, z)
+      if b and b.id == 764 and method == "turnOn" then b.on = true; return end
+      error("no such peripheral method " .. tostring(method))
+    end,
+  }
+  local function driveBelow() local b = at(T.x, T.y - 1, T.z); return b and b.id == 765 and b.dmg == 0 and b or nil end
+  E.disk = {
+    isPresent = function(side) assert(side == "bottom"); local d = driveBelow(); return d ~= nil and d.disk ~= nil end,
+    getMountPath = function(side) assert(side == "bottom"); local d = driveBelow(); return d and d.disk and "disk" or nil end,
   }
   local FS = T.files
   E.fs = {
@@ -443,6 +480,12 @@ local function envFor(T)
     move = function(a, b) assert(FS[a], "no file " .. a); FS[b] = FS[a]; FS[a] = nil end,
     getSize = function(p) return FS[p] and #FS[p] or 0 end,
     open = function(p, mode)
+      if p:match("^disk/") then
+        -- the floppy in the drive below
+        local d = driveBelow(); assert(d and d.disk and mode == "w", "no floppy below for " .. p)
+        local buf = {}
+        return { write = function(s) buf[#buf + 1] = s end, close = function() d.disk.files[p:sub(6)] = table.concat(buf) end }
+      end
       if mode == "a" then return { writeLine = function(s) FS[p] = (FS[p] or "") .. s .. "\n" end, close = function() end } end
       if mode == "w" then
         local buf = {}
@@ -482,6 +525,7 @@ local function envFor(T)
         stats.downloads = (stats.downloads or 0) + 1
         return resp(code)
       end
+      if url:find("/next?", 1, true) then T.nextZoneN = zoneN end   -- (an answer from before a zone opened is stale)
       if fastHttp then return resp(fastHttp(url)) end
       return resp(curl('"' .. url .. '"'))
     end,
@@ -509,7 +553,7 @@ local function envFor(T)
     T.log[#T.log + 1] = string.format("%8.0fs  %s", T.clock, s)
     if s:find("Nothing left to build") then T.finished = true end
     if s:find("Paused") then T.saidPaused = true end
-    if s:find(ZONES_STRICT and "the open zones are done" or "open the next zone", 1, true) and not zoneAsk then zoneAsk = T.clock end
+    if s:find(ZONES_STRICT and "the open zones are done" or "open the next zone", 1, true) and not zoneAsk and T.nextZoneN == zoneN then zoneAsk = T.clock end
     local bx, by, bz = s:match("in my way at (%-?%d+),(%-?%d+),(%-?%d+)")
     if bx and not T.toldBlock then
       T.toldBlock = true
@@ -573,6 +617,9 @@ local function postBody(path, body, key)
 end
 local stuckSince = {}
 zoneAsk = nil
+-- ZONES_STRICT=1: the next zone is opened only once a turtle is told the open zones are done (like
+-- the player, who moves the chunk loaders when every turtle is home)
+ZONES_STRICT = os.getenv("ZONES_STRICT") == "1"
 local ZONES_AUTO, ZONE_DELAY, zoneLog = os.getenv("ZONES_AUTO") == "1", tonumber(os.getenv("ZONE_DELAY") or 300), {}
 local zonesOpen
 if ZONES_AUTO then
@@ -616,9 +663,6 @@ while true do
   local T
   for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end
   if placeAt and (not T or T.clock >= placeAt) then placeTurtles(); T = nil; for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end end
--- ZONES_STRICT=1: the next zone is opened only once a turtle is told the open zones are done (like
--- the player, who moves the chunk loaders when every turtle is home)
-ZONES_STRICT = os.getenv("ZONES_STRICT") == "1"
   if not T then ended = "every turtle stopped"; break end
   if RESTART and T.clock >= RESTART then
     pressRestart(T.clock); RESTART = nil
@@ -660,7 +704,7 @@ ZONES_STRICT = os.getenv("ZONES_STRICT") == "1"
     for i = 1, zoneN do open[#open + 1] = zoneAll[i] end
     assert(postBody("/zones", table.concat(open, " "), true):match("^open"), "zones refused")
     local away = 0
-    for _, t in ipairs(turtles) do if t.x ~= t.start[1] or t.z ~= t.start[3] then away = away + 1 end end
+    for _, t in ipairs(turtles) do if t.x ~= t.start[1] or t.y ~= t.start[2] or t.z ~= t.start[3] then away = away + 1 end end
     zoneLog[#zoneLog + 1] = string.format("%s opened at %.2f h (asked %.2f h, %d placed, %d turtles away from home)", zoneAll[zoneN], clock / 3600, zoneAsk / 3600, stats.places, away)
     io.stderr:write(zoneLog[#zoneLog] .. "\n")
     zoneAsk = nil
@@ -718,6 +762,25 @@ for _, p in ipairs(expected) do
     elseif b.id ~= m.id or b.dmg ~= m.dmg then wrong = wrong + 1; if wrong <= 5 then io.write("  wrong at ", k, " have ", b.id, ":", b.dmg, " want ", m.id, ":", m.dmg, " (", p.id, ")\n") end end
   end
 end
+-- sign gantries: every drive has its floppy with the sign program and its text, every computer is on
+local SIGNPROG = (function() local h = io.open((os.getenv("CITYSIGN") or "citysign"), "rb"); local c = h and h:read("*a"); if h then h:close() end; return c end)()
+local disks, disksBad, computers, computersOff = 0, 0, 0, 0
+for _, p in ipairs(expected) do
+  for _, d in ipairs(p.disks) do
+    disks = disks + 1
+    local b = world[key(d[1], d[2], d[3])]
+    local f = b and b.disk and b.disk.files
+    local want = (d.text or ""):gsub("|", "\n") .. "\n"
+    if not (f and f["startup"] == SIGNPROG and f["sign.txt"] == want) then
+      disksBad = disksBad + 1
+      if disksBad <= 5 then io.write("  sign floppy wrong at ", key(d[1], d[2], d[3]), " (", p.id, "): ", b and b.id or "nothing", " ", f and "files" or "no floppy", "\n") end
+    end
+  end
+  for _, c in ipairs(p.cells) do
+    local m = p.mats[c[4]]
+    if m.id == 764 then computers = computers + 1; local b = world[key(c[1], c[2], c[3])]; if not (b and b.on) then computersOff = computersOff + 1 end end
+  end
+end
 local plantsLeft = 0
 for k, b in pairs(world) do
   if b.plant then
@@ -768,8 +831,9 @@ if relV then
   end
   io.write(string.format("release %s: %d of %d turtles updated (%d downloads)\n", relV, n, #turtles, stats.downloads or 0))
 end
+if CHUNKS then local f = io.open(os.getenv("CHUNKLOG"), "w"); for k in pairs(CHUNKS) do f:write(k, "\n") end; f:close() end
 io.write(string.format("Ender Chests of other turtles dug: %d\n", stats.chestsTaken or 0))
+io.write(string.format("sign floppies %d, wrong %d; sign computers %d, off %d; drives with a floppy dug %d\n", disks, disksBad, computers, computersOff, stats.disksDug or 0))
 io.write(string.format("Ender Chests put in front (top of the world): %d   torch placements refused: %d\n", stats.frontChests or 0, stats.torchFails or 0))
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
   stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))
-if CHUNKS then local f = io.open(os.getenv("CHUNKLOG"), "w"); for k in pairs(CHUNKS) do f:write(k, "\n") end; f:close() end

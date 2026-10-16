@@ -1,0 +1,103 @@
+-- citysign: one Skyline Metro overhead sign. ComputerCraft 1.63 advanced computer touching the sign's
+-- monitor wall, with a disk drive next to it holding a floppy: this program is that floppy's
+-- "startup" (cityfleet writes it there, with sign.txt), so it runs at every start of the computer.
+-- It draws the sign once and then sleeps until the monitor changes: no timers, nothing to do in
+-- between. sign.txt: the exit number (or an empty line), then the sign's lines.
+-- The text size is worked out from CC's own formula and set once (setTextScale while a player is
+-- near can crash a CC 1.63 server if it's called over and over).
+-- On its first run it copies itself and sign.txt onto the computer's own drive: when a chunk loads,
+-- the computer can boot before the disk drive is attached, and then CC runs /startup instead of the
+-- floppy's. Either way the same program runs.
+
+local dir = fs.getDir(shell.getRunningProgram())
+local exitNo, lines = "", {}
+local h = fs.open(fs.combine(dir, "sign.txt"), "r")
+if h then
+  exitNo = h.readLine() or ""
+  for l in h.readLine do lines[#lines + 1] = l end
+  h.close()
+end
+local debug = fs.exists(fs.combine(dir, "debug"))
+local function log(s)
+  if not debug then return end
+  local f = fs.open("/signlog", "a"); f.writeLine(s); f.close()
+end
+
+-- running from the floppy: keep a copy on the computer itself (only written when it differs)
+if dir ~= "" then
+  for _, f in ipairs({ "startup", "sign.txt", "debug" }) do
+    local from = fs.open(fs.combine(dir, f), "r")
+    if from then
+      local data = from.readAll(); from.close()
+      local old = fs.open("/" .. f, "r")
+      local same = old and old.readAll() == data
+      if old then old.close() end
+      if not same then local to = fs.open("/" .. f, "w"); to.write(data); to.close() end
+    end
+  end
+end
+
+local function charsAt(blocks, scale, px) return math.max(math.floor((blocks - 0.3125) / (scale * px * 0.015625) + 0.5), 1) end
+local function blocksOf(chars, scale, px) return math.floor(chars * scale * px * 0.015625 + 0.3125 + 0.5) end
+
+local mon, scale, drawnW, drawnH
+local function draw()
+  mon = nil
+  for _, s in ipairs(rs.getSides()) do
+    if peripheral.getType(s) == "monitor" then mon = peripheral.wrap(s); break end
+  end
+  if not mon then log("no monitor"); return end
+  mon.setTextScale(1)
+  local w, h = mon.getSize()
+  local bw, bh = blocksOf(w, 1, 6), blocksOf(h, 1, 9)
+  -- the biggest text that fits: the longest line plus a margin, and a blank row round each line
+  local need, rows = #exitNo + 4, #lines * 2 + 1
+  for _, l in ipairs(lines) do need = math.max(need, #l + 2) end
+  if exitNo ~= "" then rows = rows + 1 end
+  scale = 5
+  while scale > 0.5 and (charsAt(bw, scale, 6) < need or charsAt(bh, scale, 9) < rows) do scale = scale - 0.5 end
+  mon.setTextScale(scale)
+  w, h = mon.getSize()
+  drawnW, drawnH = bw, bh
+  mon.setBackgroundColor(colors.green)
+  mon.setTextColor(colors.white)
+  mon.clear()
+  local top = 1
+  if exitNo ~= "" then
+    -- the exit tab, top right
+    local tab = " EXIT " .. exitNo .. " "
+    mon.setCursorPos(math.max(1, w - #tab + 1), 1)
+    mon.setBackgroundColor(colors.yellow); mon.setTextColor(colors.black)
+    mon.write(tab)
+    mon.setBackgroundColor(colors.green); mon.setTextColor(colors.white)
+    top = 2
+  end
+  local used = #lines * 2 - 1
+  local y = top + math.max(0, math.floor((h - top + 1 - used) / 2))
+  for _, l in ipairs(lines) do
+    mon.setCursorPos(math.max(1, math.floor((w - #l) / 2) + 1), y)
+    mon.write(l)
+    y = y + 2
+  end
+  log(string.format("drew %dx%d blocks, scale %s, %dx%d chars", bw, bh, tostring(scale), w, h))
+end
+
+draw()
+-- just after a chunk loads the monitor may not be attached yet: look again a few times, then only
+-- wake up when something changes
+local tries, timer = 0, nil
+if not mon then timer = os.startTimer(2) end
+while true do
+  local e, a = os.pullEvent()
+  if e == "timer" and a == timer then
+    tries = tries + 1
+    draw()
+    if not mon and tries < 30 then timer = os.startTimer(2) end
+  elseif e == "peripheral" or e == "peripheral_detach" then
+    draw()
+  elseif e == "monitor_resize" and mon then
+    -- (setting the text size sends this too: only a monitor wall that changed size is drawn again)
+    local w, h = mon.getSize()
+    if blocksOf(w, scale, 6) ~= drawnW or blocksOf(h, scale, 9) ~= drawnH then draw() end
+  end
+end

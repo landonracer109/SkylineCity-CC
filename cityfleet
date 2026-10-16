@@ -23,7 +23,8 @@
 -- start work, or, if not, stop there with a message. It catches a spot that is off in y or z (and
 -- in x only across a step of the edge), so check each turtle's x with F3 too.
 -- With nothing to do (the server says wait) I wait up at the wait height, above everything the
--- build places, straight up from where I finished, so I'm never in another turtle's way (v1.12).
+-- build places, straight up from where I finished, so I'm never in another turtle's way (v1.12);
+-- on my depot spot I wait right there (v1.15: between zones everybody waits at home).
 -- When the whole build is done and I'm home, I stop and wait (v1.13). The server can also tell me to
 -- stop ("stop": I wasn't started for the build it has now); reports from a turtle like that are
 -- answered "pause".
@@ -34,11 +35,17 @@
 -- fresh from my depot spot, as if "cityfleet <slot> go" had been typed. No commands to type. (A turtle
 -- that reboots where it is, say after a Minecraft server restart, never switched itself off, so it
 -- carries on from its saved state instead, and gets stopped like the others.)
+-- Sign gantries (v1.15): a cell line with a 4th number is placed forward (the way to face; I stand
+-- one block back at the same height, got to from one above), so the advanced monitors stand upright
+-- against the panel behind them. A floppy cell (the spot of the disk drive placed just before) puts a
+-- floppy in that drive and writes the sign program (citysign, from the job server) and the sign's text
+-- (the "sign" line after it) onto it; an advanced computer is turned on once placed. Computers, drives
+-- and monitors already there are never dug.
 -- Travelling, I fly at one height per direction (east, west, south, north each have their own lane
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.14"
+local VERSION = "v1.15"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -118,15 +125,16 @@ local plan
 local function loadPlan()
   local h = fs.open(PLAN_FILE, "r")
   if not h then return nil, "no build file" end
-  local p = { mats = {}, xs = {}, ys = {}, zs = {}, ms = {} }
+  local p = { mats = {}, xs = {}, ys = {}, zs = {}, ms = {}, fs = {}, sign = {} }
   local y, at = 0, nil
   while true do
     local line = h.readLine()
     if not line then break end
-    local a, b, c = line:match("^(%-?%d+) (%-?%d+) (%d+)$")
+    local a, b, c, f = line:match("^(%-?%d+) (%-?%d+) (%d+) ?([0-3]?)$")
     if a then
       local n = #p.xs + 1
       p.xs[n], p.ys[n], p.zs[n], p.ms[n] = tonumber(a) + at.x, y + at.y, tonumber(b) + at.z, tonumber(c)
+      p.fs[n] = tonumber(f)          -- placed forward, facing this way
     else
       local cmd, rest = line:match("^(%S+)%s*(.*)$")
       if cmd == "L" then y = tonumber(rest)
@@ -137,6 +145,7 @@ local function loadPlan()
         local n, id, dmg, name = rest:match("^(%d+) (%d+) (%d+) (.*)$")
         p.mats[tonumber(n)] = { id = tonumber(id), dmg = tonumber(dmg), name = name }
       elseif cmd == "name" then p.name = rest
+      elseif cmd == "sign" then p.sign[#p.xs] = rest
       elseif cmd == "end" then p.complete = true end
     end
   end
@@ -656,29 +665,91 @@ local function propUpTorch(x, y, z)
   return ok
 end
 
-local function placeCell(i)
+-- Sign gantry parts: what peripheral.getType says when one is already there (never dug: a drive
+-- would throw its floppy out), and the floppy that goes in the drive.
+local PERIPH = { ["765:4"] = "monitor", ["765:0"] = "drive", ["764:16384"] = "computer" }
+local FLOPPY = 5883
+
+-- the sign program, from the job server (kept, in case the server can't be reached next time)
+local function signProgram()
+  for _ = 1, 30 do
+    local code = get("/sign")
+    if code and code:match("^%-%- citysign") and loadstring(code) then writeFile("citysign", code); return code end
+    code = readFile("citysign")
+    if code then return code end
+    say("Can't get the sign program from the job server; trying again in 20 s.")
+    sleep(20)
+  end
+  error("No sign program (the job server's /sign).")
+end
+
+-- the floppy for the drive below the spot: put it in (unless one is there) and write the sign onto it
+local function loadSign(i)
   local x, y, z, m = plan.xs[i], plan.ys[i], plan.zs[i], plan.ms[i]
   goTo(x, y + 1, z)
-  local torch = (plan.mats[m].id .. ":" .. plan.mats[m].dmg) == MAGNUM
+  if peripheral.getType("bottom") ~= "drive" then error(string.format("No disk drive at %d,%d,%d for the sign's floppy.", x, y, z)) end
+  for _ = 1, 100 do
+    if disk.isPresent("bottom") then break end
+    local s = slotFor(m)
+    if not s then restock(m)
+    else
+      turtle.select(s)
+      if turtle.dropDown() then dirty = true else sleep(0.5) end
+    end
+  end
+  local mp
+  for _ = 1, 20 do
+    mp = disk.isPresent("bottom") and disk.getMountPath("bottom")
+    if mp then break end
+    sleep(0.5)
+  end
+  if not mp then error(string.format("Can't read the floppy in the disk drive at %d,%d,%d.", x, y, z)) end
+  writeFile(mp .. "/startup", signProgram())
+  writeFile(mp .. "/sign.txt", (plan.sign[i] or ""):gsub("|", "\n") .. "\n")
+end
+
+local function placeCell(i)
+  local x, y, z, m = plan.xs[i], plan.ys[i], plan.zs[i], plan.ms[i]
+  if plan.mats[m].id == FLOPPY then return loadSign(i) end
+  local f = plan.fs[i]
+  local detect, compare, place, dig, attack, side = turtle.detectDown, turtle.compareDown, turtle.placeDown, turtle.digDown, turtle.attackDown, "bottom"
+  if f then
+    -- forward: one block back from the spot, from one above (this layer is built, the one above isn't)
+    goTo(x - DX[f], y + 1, z - DZ[f])
+    moveY(y)
+    turnTo(f)
+    detect, compare, place, dig, attack, side = turtle.detect, turtle.compare, turtle.place, turtle.dig, turtle.attack, "front"
+  else
+    goTo(x, y + 1, z)
+  end
+  local key = plan.mats[m].id .. ":" .. plan.mats[m].dmg
+  local torch, periph = key == MAGNUM, PERIPH[key]
+  local function done()
+    if periph == "computer" then pcall(peripheral.call, side, "turnOn") end
+  end
   local fails, propped = 0, false
   for _ = 1, 200 do
+    if periph and peripheral.getType(side) == periph then return done() end
     local s = slotFor(m)
     if not s then
       restock(m)
     else
       turtle.select(s)
-      if turtle.detectDown() then
-        if turtle.compareDown() then return end
-        turtle.digDown(); dirty = true
-      elseif turtle.placeDown() then
-        return
+      if detect() then
+        if compare() then return done() end
+        local there = peripheral.getType(side)
+        if there == "turtle" then sleep(1)
+        elseif there then error(string.format("A %s is where the %s goes at %d,%d,%d; I won't dig it.", there, plan.mats[m].name, x, y, z))
+        else dig(); dirty = true end
+      elseif place() then
+        return done()
       else
         fails = fails + 1
         if torch and fails >= 3 and not propped then
           propped = true
           if not propUpTorch(x, y, z) then say("No solid block to put under the torch; I need one of this job's blocks.") end
         else
-          turtle.attackDown(); sleep(0.5)
+          attack(); sleep(0.5)
         end
       end
     end
@@ -698,8 +769,10 @@ local function ask()
   local head = L[1] or ""
   if head:match("^wait") then
     local secs, why = head:match("^wait (%d+) ?(.*)")
-    -- wait above everything (the column I'm in is clear up there: I came down it), out of everyone's way
-    if st.lanes.wait < 256 and pos.y < st.lanes.wait then moveY(st.lanes.wait); save() end
+    -- wait above everything (the column I'm in is clear up there: I came down it), out of everyone's way;
+    -- on my depot spot I wait right there (between zones everybody waits at home)
+    local home = st.home and pos.x == st.home.x and pos.y == st.home.y and pos.z == st.home.z
+    if not home and st.lanes.wait < 256 and pos.y < st.lanes.wait then moveY(st.lanes.wait); save() end
     if why ~= lastMsg then tell("Waiting: " .. (why or "")) end
     sleep(tonumber(secs) or 30)
     return

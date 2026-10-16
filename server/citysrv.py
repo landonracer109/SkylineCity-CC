@@ -5,6 +5,8 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
   GET  /city/next?t=<label>&x=&y=&z=        -> a job + route, or "wait <s> <why>", or "home ..." + route, or "none",
                                                or "stop <why>" (that turtle never said hello to this build)
   GET  /city/plan/<job id>                  -> the job's build file
+  GET  /city/sign                           -> citysign, the sign gantries' program (next to this file or
+                                               one folder up); turtles write it onto each sign's floppy
   GET  /city/done?t=<label>&job=<id>        -> "ok"
   POST /city/report?t=<label>               body: "key value" lines (job, cell, total, x, y, z, fuel, msg, need)
   GET  /city/needs                          -> what each turtle's Ender Chest should hold next
@@ -42,10 +44,10 @@ to be built at the same time ("excl": their turtles' paths cross) and "prio" (bl
 chain of jobs that wait on it: those go first). The lanes are given as world heights above everything
 the build places; columns taller than the lowest lane (downtown's towers) are flown round. Routes are
 straight runs: an L if one is clear, else a search that avoids turns.
-Depot: DEPOT_ROW slots per row (0 = one row), rows DEPOT_ROWSTEP blocks apart in z.
-
 When the open zones are done (and a zone is still closed), every turtle flies home and waits there:
 the depot stays loaded, so the done zone's chunk loaders can be moved to the next zone before it opens.
+Depot: DEPOT_ROW slots per row (0 = one row), rows DEPOT_ROWSTEP blocks apart in z.
+
 Position check (for a repair of a pasted city, where a turtle that is a block off would dig the paste):
 env CHECK='{"y": 63, "rows": [[x0, x1, lastZ], ...]}' = the ground layer's y and, for x0..x1, the last z
 the paste reaches. On a first start a turtle flies north from its depot spot at home height, digging
@@ -655,6 +657,13 @@ class H(BaseHTTPRequestHandler):
                         return self.reply(200, "nojob\n")
                     with open(os.path.join(JOBS_DIR, city.jobs[jid]["file"]), "rb") as f:
                         return self.reply(200, f.read())
+                if path == "/city/sign":
+                    here = os.path.dirname(os.path.abspath(__file__))
+                    for f in (os.path.join(here, "citysign"), os.path.join(here, "..", "citysign")):
+                        if os.path.exists(f):
+                            with open(f, "rb") as h:
+                                return self.reply(200, h.read())
+                    return self.reply(404, "no citysign\n")
                 if path == "/city/done":
                     city.finish(q["t"], q["job"])
                     return self.reply(200, "ok\n")
