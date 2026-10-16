@@ -14,7 +14,7 @@
 -- any colours. Private chests work and keep other players out: all 32 must be yours.)
 
 local args = { ... }
-local VERSION = "v1.03"
+local VERSION = "v1.04"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local EVERY = 30            -- seconds between rounds
 local COAL = "173:0"        -- coal blocks, the turtles' fuel
@@ -23,9 +23,10 @@ local MIN_SEND = 16         -- don't bother topping up less than this (unless th
 local MAP_FILE, CFG_FILE = "citysupply.map2", "citysupply.cfg"   -- (.map from v1.00/1.01 may be wrong: not used)
 -- While working out the layout every home chest needs colours of its own (chests on the same colours
 -- share one inventory, so a test item shows up in all of them). Chests that share colours get these
--- for now: black, black and a third colour per chest (frequency 0xFF0 + n). A turtle's colours
--- replace them when it first reports. Change TEMP_FREQ in citysupply.cfg if you use those colours.
-local TEMP_FREQ = 0xFF0
+-- for now: black and two more colours per chest (frequency 0xF00 + n, room for 256; colours any
+-- chest or turtle already uses are skipped). A turtle's colours replace them when it first reports.
+-- Change TEMP_FREQ in citysupply.cfg if you use those colours.
+local TEMP_FREQ = 0xF00
 local DIRS = { "north", "south", "east", "west", "up", "down" }
 local OPP = { north = "south", south = "north", east = "west", west = "east", up = "down", down = "up" }
 
@@ -119,6 +120,9 @@ local function buildMap()
     local f = tonumber(try(c, "getFrequency"))
     if f and count[f] == 1 then count[f] = 0 end    -- this one is a turtle's home chest already
   end
+  local given, used = 0, {}    -- colours in use (turtles' and home chests'): never handed out again
+  for f in pairs(count) do used[f] = true end
+  for _, c in pairs(chests) do local f = tonumber(try(c, "getFrequency")); if f then used[f] = true end end
   local names = {}
   for name in pairs(chests) do names[#names + 1] = name end
   table.sort(names)
@@ -127,7 +131,8 @@ local function buildMap()
     local f = tonumber(try(c, "getFrequency"))
     if not f or count[f] ~= 0 then
       local nf = TEMP_FREQ + n
-      n = n + 1
+      while used[nf] and nf < 0xFFF do nf = nf + 1 end
+      n, used[nf], given = nf - TEMP_FREQ + 1, true, given + 1
       try(c, "setFrequency", nf)
       if tonumber(try(c, "getFrequency")) ~= nf then
         say("Can't change the colours of " .. name .. ". Give the home chests different colours by hand, then run citysupply map.")
@@ -135,7 +140,7 @@ local function buildMap()
       end
     end
   end
-  if n > 0 then say(n .. " home chests got colours of their own for now (black, black, a third colour).") end
+  if given > 0 then say(given .. " home chests got colours of their own for now (black and two more colours).") end
   local unmapped = {}
   for name in pairs(chests) do if not map[name] then unmapped[name] = true end end
   for iname, ae in pairs(ifaces) do

@@ -62,7 +62,7 @@ local function chestP(name)
   return {
     getAllStacks = function() calls = calls + 1; if math.random() < .5 then suck() end; local t = {}; for s = 1, 27 do t[s] = c.inv[s] and { id = c.inv[s].id, dmg = c.inv[s].dmg, qty = c.inv[s].qty } end; return t end,
     getFrequency = function() calls = calls + 1; return c.freq end,
-    setFrequency = function(f) calls = calls + 1; c.freq = f end,
+    setFrequency = function(f) calls = calls + 1; if f >= 0 and f <= 0xFFF then c.freq = f end end,
     pushItem = function(dir, slot, n)
       calls = calls + 1
       -- into the interface on that side = back into AE
@@ -78,7 +78,22 @@ local function chestP(name)
     end,
   }
 end
-local P = { me_interface_0 = iface("me_interface_0"), me_interface_1 = iface("me_interface_1") }
+-- MANY=n: n home chests, all on frequency 0, 5 round each interface (n/5 interfaces, rounded up);
+-- like EnderStorage, colours past 0xFFF are refused. Every chest must end up mapped.
+local MANY = tonumber(os.getenv("MANY") or 0)
+if MANY > 0 then
+  CH, SIDES = {}, {}
+  local five = { "north", "south", "east", "west", "up" }
+  for k = 0, MANY - 1 do
+    CH["ender_chest_" .. k] = newChest(0)
+    local i = "me_interface_" .. math.floor(k / 5)
+    SIDES[i] = SIDES[i] or {}
+    SIDES[i][five[k % 5 + 1]] = "ender_chest_" .. k
+  end
+  NEEDS = "city1 chest 100\ncity1 1:0 64\n"
+end
+local P = {}
+for name in pairs(SIDES) do P[name] = iface(name) end
 for name in pairs(CH) do P[name] = chestP(name) end
 peripheral = {
   getNames = function() local t = {}; for k in pairs(P) do t[#t + 1] = k end; table.sort(t); return t end,
@@ -86,7 +101,7 @@ peripheral = {
   getType = function(n) return n:match("^(.-)_%d+$") end,
   wrap = function(n) return P[n] end,
 }
-local NEEDS = "city1 chest 100\ncity1 4095:0 380\ncity1 928:2 200\ncity1 22:0 60\ncity2 chest 200\ncity2 1:0 640\ncity3 chest 300\n"
+NEEDS = "city1 chest 100\ncity1 4095:0 380\ncity1 928:2 200\ncity1 22:0 60\ncity2 chest 200\ncity2 1:0 640\ncity3 chest 300\n"
 local POSTED = {}
 http = {
   get = function(url)
@@ -127,6 +142,16 @@ local function show(name)
   for k, n in pairs(total) do t[#t + 1] = k .. "=" .. n end
   table.sort(t)
   print(string.format("  %s (colours %d): %s", name, CH[name].freq, table.concat(t, " ")))
+end
+if MANY > 0 then
+  local seen, dup, mapped = {}, 0, 0
+  for name, c in pairs(CH) do if seen[c.freq] then dup = dup + 1 end; seen[c.freq] = true end
+  local h = io.open(DIR .. "/citysupply.map2"); local m = h and h:read("*a") or ""; if h then h:close() end
+  for _ in m:gmatch("ender_chest_%d+") do mapped = mapped + 1 end
+  local lh = io.open(DIR .. "/supply.log"); local log = lh and lh:read("*a") or ""; if lh then lh:close() end
+  print(string.format("MANY %d: chests sharing colours %d, chests in the map %d", MANY, dup, mapped))
+  for l in log:gmatch("[^\n]+") do if l:find("colours") or l:find("chests next") or l:find("Can't") then print("  log: " .. l) end end
+  os.exit(0)
 end
 print("chests after 2 rounds:")
 for _, n in ipairs({ "ender_chest_0", "ender_chest_1", "ender_chest_2", "ender_chest_3", "ender_chest_4" }) do show(n) end
