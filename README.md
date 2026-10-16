@@ -23,8 +23,9 @@ server. Built for Minecraft 1.6.4 with OpenPeripherals, EnderStorage and Applied
   what its next ~640 placements need, plus coal blocks, and sends everything else back.
 - **`citydeploy`** (one turtle at home): the **Deploy fleet** button on the page sends it out to put
   the fleet from its chest on the free depot spots, facing north, each with an Ender Chest, and turn
-  them on; cityfleet (v1.16+) then starts fresh as that spot's slot by itself. Every fleet turtle
-  needs cityfleet installed and run once by hand; after that, pick it up and put it in the chest.
+  them on; cityfleet (v1.16+) then starts fresh as that spot's slot by itself. It installs the
+  released cityfleet on each one from a floppy in a disk drive it puts behind it, so the turtles can
+  be brand new, with no programs on them.
 - **`citysign`**: the program on each Skyline Metro sign gantry's floppy (cityfleet writes it there):
   draws the sign once, then sleeps until the monitor changes.
 - **`citybuild`**: the older single-building version of the turtle program (no server).
@@ -63,7 +64,8 @@ citysupply
 
 Deployer: any turtle on a home spot with a block under it and nothing above, facing north, a
 (double) chest of fleet turtles on its left (west), a chest of their Ender Chests on its right (east),
-coal blocks in its slot 16.
+a disk drive in its slot 14, a floppy disk in slot 15 and coal blocks in slot 16. The fleet turtles
+need a Narcissistic upgrade and a diamond pickaxe, nothing else.
 
 ```
 get https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/<commit>/citydeploy citydeploy

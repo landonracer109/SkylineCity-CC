@@ -2,24 +2,33 @@
 -- server's Deploy fleet button is pressed, puts the fleet out: each turtle on a free depot spot,
 -- facing north, with an Ender Chest dropped into it, then turned on. Before turning one on I tell the
 -- server its computer id and spot, so cityfleet (v1.16+) starts fresh as that slot by itself.
--- Turtles keep their files when picked up, so every fleet turtle needs cityfleet installed (and run)
--- once by hand; after that it only needs picking up and putting in my chest.
+-- I install cityfleet myself, so the turtles can be brand new (no programs at all): I put a disk
+-- drive behind each one (south of its spot) with my floppy in it, holding the released cityfleet
+-- (from the server's status) and an installer as its startup. The turtle boots from the floppy, copies
+-- cityfleet and a startup to itself, and once I take the floppy and drive back it reboots into
+-- cityfleet. A turtle that already has cityfleet gets the released one the same way.
 --
--- Setup: my home spot has a block under it and nothing above it. Facing NORTH, a (double) chest on
--- my LEFT (west) holds the fleet turtles and one on my RIGHT (east) their Ender Chests (any colours:
--- citysupply pairs home chests by colour). Coal blocks in my slot 16 for my own fuel.
+-- Setup: I am a mining turtle (pickaxe, to take my disk drive back up). My home spot has a block
+-- under it and nothing above it. Facing NORTH, a (double) chest on my LEFT (west) holds the fleet
+-- turtles (Narcissistic upgrade + diamond pickaxe; brand new is fine) and one on my RIGHT (east) their
+-- Ender Chests (any colours: citysupply pairs home chests by colour). In me: a disk drive in slot 14,
+-- a floppy disk in slot 15, coal blocks in slot 16 for my own fuel.
 --   citydeploy <x> <y> <z> [server]   first start, on my home spot facing north (F3 coordinates)
 --   citydeploy                        carries on (runs from startup by itself)
--- Then I wait. Deploy fleet on the page: I take up to 7 turtles and 7 chests at a time, fly at 3 above
--- the depot spots, fill the free ones in slot order (a spot with something on it is skipped), and come
--- back for more until I run out of turtles, chests or spots. I never dig anything.
+-- Then I wait. Deploy fleet on the page: I take up to 6 turtles and 6 chests at a time, fly at 3 above
+-- the depot spots, fill the free ones in slot order (a spot with something on it, or on the block
+-- south of it, is skipped), and come back for more until I run out of turtles, chests or spots. I never
+-- dig anything but my own disk drive.
 
 local args = { ... }
-local VERSION = "v1.00"
-local CFG_FILE, STATE_FILE = "citydeploy.cfg", "citydeploy.state"
+local VERSION = "v1.01"
+local CFG_FILE, STATE_FILE, CODE_FILE = "citydeploy.cfg", "citydeploy.state", "cityfleet.disk"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
+local REPO = "https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/"
 local FUEL, MIN_FUEL = 16, 1000
-local BATCH = 7                       -- turtles in slots 1-7, their chests in 8-14
+local BATCH = 6                       -- turtles in slots 1-6, their chests in 7-12
+local DRIVE, FLOPPY = 14, 15
+local INSTALL_WAIT, INSTALL_TRIES = 15, 4
 local DX = { [0] = 1, 0, -1, 0 }      -- facing: 0 +x (east), 1 +z (south), 2 -x (west), 3 -z (north)
 local DZ = { [0] = 0, 1, 0, -1 }
 
@@ -127,7 +136,12 @@ local function load()
   turnTo(2)
   local t = 0
   for s = 1, BATCH do
-    if turtle.getItemCount(s) == 0 then turtle.select(s); if not turtle.suck() then break end end
+    if turtle.getItemCount(s) == 0 then
+      turtle.select(s)
+      if not turtle.suck() then break end
+      -- brand-new turtles stack: one per slot, the rest back
+      if turtle.getItemCount(s) > 1 then turtle.drop(turtle.getItemCount(s) - 1) end
+    end
   end
   for s = 1, BATCH do if turtle.getItemCount(s) > 0 then t = t + 1 end end
   turnTo(0)
@@ -152,13 +166,116 @@ local function unload()
   turnTo(3)
 end
 
--- one above spot n: put the turtle from slot s there (facing north, like me), tell the server, give it
--- its chest, turn it on. st.cur keeps where I am in this, for a restart.
+-- installing cityfleet: the floppy holds the released cityfleet and this installer as its startup.
+-- A turtle boots from a floppy in a drive next to it before its own startup (tested in game).
+local INSTALLER = [==[
+-- citydeploy's installer: copy cityfleet from this floppy, then wait for the deployer to take the
+-- floppy back and reboot into cityfleet.
+local d = fs.getDir(shell.getRunningProgram())
+if fs.exists("cityfleet") then fs.delete("cityfleet") end
+fs.copy(d .. "/cityfleet", "cityfleet")
+local h = fs.open("startup", "w"); h.write('shell.run("cityfleet")\n'); h.close()
+-- my job server is the deployer's
+h = fs.open("cityfleet.cfg", "r")
+local cfg = h and textutils.unserialize(h.readAll())
+if h then h.close() end
+if type(cfg) ~= "table" then cfg = { label = os.getComputerLabel() or ("new" .. os.getComputerID()) } end
+cfg.server = "SERVER_URL"
+h = fs.open("cityfleet.cfg", "w"); h.write(textutils.serialize(cfg)); h.close()
+h = fs.open(d .. "/ok" .. os.getComputerID(), "w"); h.write("ok"); h.close()
+print("cityfleet installed. Waiting for the deployer to take its floppy back.")
+while fs.exists(d .. "/startup") do sleep(0.5) end
+os.reboot()
+]==]
+
+local fleetCode           -- the released cityfleet, first line "-- <version> <commit>"
+
+-- the release from the server's status, downloaded once (kept in CODE_FILE)
+local function getCode()
+  local s = get("/status.json")
+  local v, sha = (s or ""):match('"release": {"v": "(v[%d%.]+)", "commit": "(%x+)"}')
+  if not v or #sha ~= 40 then return nil, "the server has no cityfleet release" end
+  local tag = "-- " .. v .. " " .. sha
+  local have = readFile(CODE_FILE)
+  if have and have:match("^[^\n]*") == tag then return have end
+  local ok, r = pcall(http.get, REPO .. sha .. "/cityfleet")
+  local c = ok and r and r.readAll()
+  if r then r.close() end
+  if not c or not c:find('local VERSION = "' .. v .. '"', 1, true) or not loadstring(c) then
+    return nil, "cityfleet " .. v .. " didn't download"
+  end
+  c = tag .. "\n" .. c
+  writeFile(CODE_FILE, c)
+  return c
+end
+
+-- the floppy in the drive below me: cityfleet (if it isn't that one already), the installer, no old marks
+local function fillDisk()
+  local mp = disk.getMountPath("bottom")
+  if not mp then return nil end
+  for _, f in ipairs(fs.list(mp)) do if f:match("^ok%d+$") then fs.delete(fs.combine(mp, f)) end end
+  local h = fs.open(fs.combine(mp, "cityfleet"), "r")
+  local first = h and h.readLine()
+  if h then h.close() end
+  if first ~= fleetCode:match("^[^\n]*") then writeFile(fs.combine(mp, "cityfleet"), fleetCode) end
+  writeFile(fs.combine(mp, "startup"), (INSTALLER:gsub("SERVER_URL", function() return cfg.server end)))
+  return mp
+end
+
+-- drive and floppy out of the drive below me, back into my slots (false: I can't dig it)
+local function takeDrive()
+  if peripheral.getType("bottom") ~= "drive" then return true end
+  turtle.select(FLOPPY); turtle.suckDown()
+  turtle.select(DRIVE)
+  return turtle.digDown() and turtle.getItemCount(DRIVE) > 0
+end
+local NO_PICK = "I can't pick my disk drive back up: I need a pickaxe (a mining turtle)"
+
+-- the turtle on spot cur is placed (and on the server): drive behind it (south) with my floppy, turn
+-- it on (or reboot it) from above it, and watch the floppy for its mark. Then drive and floppy back:
+-- the turtle sees the floppy go and reboots into cityfleet.
+local function install(cur)
+  local x, y, z = cur.x, cur.y, cur.z
+  goTo(x, y + 1, z + 1)
+  if not turtle.detectDown() then turtle.select(DRIVE); turtle.placeDown() end
+  local ok = false
+  if peripheral.getType("bottom") == "drive" then
+    if turtle.getItemCount(FLOPPY) > 0 then turtle.select(FLOPPY); turtle.dropDown() end
+    sleep(0.5)
+  end
+  if peripheral.getType("bottom") == "drive" and fillDisk() then
+    for _ = 1, INSTALL_TRIES do
+      goTo(x, y + 1, z)
+      local on = select(2, pcall(peripheral.call, "bottom", "isOn"))
+      pcall(peripheral.call, "bottom", on and "reboot" or "turnOn")
+      goTo(x, y + 1, z + 1)
+      for _ = 1, INSTALL_WAIT * 2 do
+        local mp = disk.getMountPath("bottom")
+        if mp and fs.exists(fs.combine(mp, "ok" .. cur.id)) then ok = true; break end
+        sleep(0.5)
+      end
+      if ok then break end
+    end
+  end
+  if not takeDrive() then error(NO_PICK, 0) end
+  if not ok then
+    -- no install: switched on all the same (a turtle that has cityfleet starts with its own)
+    goTo(x, y + 1, z)
+    pcall(peripheral.call, "bottom", "turnOn")
+  end
+  return ok
+end
+
+-- put the turtle from slot s on spot n (facing north, like me), tell the server, give it its chest,
+-- install cityfleet on it and start it. st.cur keeps where I am in this, for a restart.
 local function placeOne(n, spot, s)
   local x, y, z = spot[1], spot[2], spot[3]
   st.cur = { n = n, s = s, x = x, y = y, z = z }
   save()
-  flyTo(x, y + 1, z, st.high)
+  -- the block south of the spot takes my disk drive: something there and the spot isn't mine to use
+  flyTo(x, y + 1, z + 1, st.high)
+  if turtle.detectDown() then st.cur = nil; save(); return "taken" end
+  goTo(x, y + 1, z)
   turnTo(3)
   -- anything on the spot (another turtle, a block): not mine to use
   turtle.select(s)
@@ -167,16 +284,17 @@ local function placeOne(n, spot, s)
   st.cur.placed = true; save()
   local ok, id = pcall(peripheral.call, "bottom", "getID")
   if not ok or type(id) ~= "number" or id < 0 then
-    -- a turtle that has never been on has no id yet: it can't have cityfleet either
-    say(string.format("The turtle on spot %d has never been used (no computer id): install cityfleet on it once by hand.", n))
-  else
-    postSure(string.format("/deploy/placed?slot=%d&id=%d", n, id))
+    pcall(peripheral.call, "bottom", "turnOn")
+    ok, id = pcall(peripheral.call, "bottom", "getID")
   end
+  if not ok or type(id) ~= "number" or id < 0 then st.cur = nil; save(); return "noid" end
+  st.cur.id = id; save()
+  postSure(string.format("/deploy/placed?slot=%d&id=%d", n, id))
   if turtle.getItemCount(s + BATCH) > 0 then turtle.select(s + BATCH); turtle.dropDown(1) end
-  pcall(peripheral.call, "bottom", "turnOn")
+  local inst = install(st.cur)
   st.cur = nil
   save()
-  return "placed", id
+  return inst and "placed" or "noinstall", id
 end
 
 local function deploy(reply)
@@ -189,15 +307,25 @@ local function deploy(reply)
   local skip = st.skip or {}
   st.high = math.max(spots[1][2], cfg.home.y) + 3       -- flying height: over the turtles and their chests
   save()
-  local placed, nextI, trip = 0, 1, nil
+  local why
+  fleetCode, why = getCode()
+  if not fleetCode then return "can't install cityfleet: " .. why end
+  if turtle.getItemCount(DRIVE) == 0 or turtle.getItemCount(FLOPPY) == 0 then
+    return string.format("I need a disk drive in my slot %d and a floppy disk in slot %d", DRIVE, FLOPPY)
+  end
+  local placed, nextI, trip, failed = 0, 1, nil, {}
+  local function sum(s)
+    if #failed > 0 then s = s .. "; cityfleet didn't install on spot " .. table.concat(failed, ", ") end
+    return s
+  end
   while true do
     if carrying() == 0 then
       flyTo(cfg.home.x, cfg.home.y, cfg.home.z, st.high)
       unload(); bad = {}
-      if trip == placed then return string.format("the rest of my chest won't place (not turtles?): %d placed", placed) end
+      if trip == placed then return sum(string.format("the rest of my chest won't place (not turtles?): %d placed", placed)) end
       trip = placed
       if load() == 0 then
-        return string.format("out of turtles or Ender Chests: %d placed", placed)
+        return sum(string.format("out of turtles or Ender Chests: %d placed", placed))
       end
     end
     for s = 1, BATCH do
@@ -205,11 +333,15 @@ local function deploy(reply)
         while nextI <= #spots and (used[spots[nextI].n] or skip[spots[nextI].n]) do nextI = nextI + 1 end
         if nextI > #spots then
           flyTo(cfg.home.x, cfg.home.y, cfg.home.z, st.high); unload()
-          return string.format("no free depot spots left: %d placed", placed)
+          return sum(string.format("no free depot spots left: %d placed", placed))
         end
         local sp = spots[nextI]
         local r, id = placeOne(sp.n, sp, s)
-        if r == "placed" then placed = placed + 1; used[sp.n] = true; print(string.format("Spot %d: turtle %s.", sp.n, tostring(id)))
+        if r == "placed" or r == "noinstall" then
+          placed = placed + 1; used[sp.n] = true
+          if r == "noinstall" then failed[#failed + 1] = tostring(sp.n) end
+          print(string.format("Spot %d: turtle %s%s.", sp.n, tostring(id), r == "noinstall" and ", but cityfleet didn't install" or ""))
+        elseif r == "noid" then used[sp.n] = true; failed[#failed + 1] = tostring(sp.n); print(string.format("Spot %d: the turtle has no computer id.", sp.n))
         elseif r == "bad" then bad[s] = true; print(string.format("The item in my slot %d won't place: taking it back.", s))
         else skip[sp.n] = true; st.skip = skip; save(); print(string.format("Spot %d is taken.", sp.n)) end
       end
@@ -249,11 +381,19 @@ local function run()
   -- a turtle I had placed but not yet started when I stopped: finish it (placed: it's gone from my slot)
   if st.cur and (st.cur.placed or turtle.getItemCount(st.cur.s) == 0) then
     local cur = st.cur
-    flyTo(cur.x, cur.y + 1, cur.z, st.high or cur.y + 3)
+    fleetCode = readFile(CODE_FILE)
+    -- my drive may still be out behind it
+    flyTo(cur.x, cur.y + 1, cur.z + 1, st.high or cur.y + 3)
+    if not takeDrive() then error(NO_PICK, 0) end
+    goTo(cur.x, cur.y + 1, cur.z)
     if peripheral.getType("bottom") == "turtle" then
       local ok, id = pcall(peripheral.call, "bottom", "getID")
-      if ok and type(id) == "number" and id >= 0 then postSure(string.format("/deploy/placed?slot=%d&id=%d", cur.n, id)) end
-      if turtle.getItemCount(cur.s + BATCH) > 0 then turtle.select(cur.s + BATCH); turtle.dropDown(1) end
+      if ok and type(id) == "number" and id >= 0 then
+        postSure(string.format("/deploy/placed?slot=%d&id=%d", cur.n, id))
+        if turtle.getItemCount(cur.s + BATCH) > 0 then turtle.select(cur.s + BATCH); turtle.dropDown(1) end
+        cur.id = id
+        if fleetCode then install(cur) end
+      end
       pcall(peripheral.call, "bottom", "turnOn")
     end
     st.cur = nil; save()
