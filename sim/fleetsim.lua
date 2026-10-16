@@ -546,7 +546,7 @@ local function envFor(T)
   E.sleep = function(n) if restartDue(T) then coroutine.yield("KILL") end; act(T, n) end
   E.read = function() return "" end
   E.os = setmetatable({ day = function() return 1 end, time = function() return 12 end, clock = function() return T.clock - T.boot end,
-    setComputerLabel = function() end, reboot = function() coroutine.yield("KILL") end, shutdown = function() coroutine.yield("OFF") end }, { __index = os })
+    setComputerLabel = function() end, getComputerID = function() return 100 + T.n end, getComputerLabel = function() return "city" .. T.n end, reboot = function() coroutine.yield("KILL") end, shutdown = function() coroutine.yield("OFF") end }, { __index = os })
   E.textutils = textutils
   E.print = function(s)
     s = tostring(s)

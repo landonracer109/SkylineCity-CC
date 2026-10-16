@@ -35,6 +35,10 @@
 -- fresh from my depot spot, as if "cityfleet <slot> go" had been typed. No commands to type. (A turtle
 -- that reboots where it is, say after a Minecraft server restart, never switched itself off, so it
 -- carries on from its saved state instead, and gets stopped like the others.)
+-- Deploy fleet (v1.16, a button on the job server's page): the deployer turtle (citydeploy) puts
+-- turtles on the free depot spots facing north, drops an Ender Chest into each and turns it on, having
+-- told the server that turtle's computer id and spot. On boot I send my id; the answer "fresh <slot>"
+-- makes me that slot (label city<slot>): I move the chest to slot 16 and start fresh, untyped.
 -- Sign gantries (v1.15): a cell line with a 4th number is placed forward (the way to face; I stand
 -- one block back at the same height, got to from one above), so the advanced monitors stand upright
 -- against the panel behind them. A floppy cell (the spot of the disk drive placed just before) puts a
@@ -45,7 +49,7 @@
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.15"
+local VERSION = "v1.16"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -1003,18 +1007,34 @@ if args[1] then
   cfg = { slot = slot, label = "city" .. slot, server = server:gsub("/$", "") }
   writeFile(CFG_FILE, textutils.serialize(cfg))
   if not startFresh(args[#args] ~= "go") then return end
-elseif not cfg or not loadState() then
-  say("Usage: cityfleet <slot> [server] [go] | cityfleet status"); return
 else
-  -- Restart turtles: someone put me back on my depot spot and turned me on (or I was home)
-  local b = get("/boot?t=" .. cfg.label)
-  local home = pos.x == st.home.x and pos.y == st.home.y and pos.z == st.home.z
-  if b and b:match("^fresh") and (st.off or home) then
-    if turtle.getItemCount(CHEST) == 0 then
+  -- Restart turtles: someone put me back on my depot spot and turned me on (or I was home).
+  -- Deploy fleet: the deployer put me on a depot spot and told the server my computer id first, so
+  -- /boot says "fresh <slot>": I become that slot (even with no saved state) and start fresh.
+  local hadState = cfg ~= nil and loadState()
+  cfg = cfg or { server = DEFAULT_SERVER, label = os.getComputerLabel() or ("new" .. os.getComputerID()) }
+  local b = get("/boot?t=" .. cfg.label .. "&id=" .. os.getComputerID())
+  local slot = b and tonumber(b:match("^fresh (%d+)"))
+  if slot then
+    cfg.slot, cfg.label = slot, "city" .. slot
+    writeFile(CFG_FILE, textutils.serialize(cfg))
+  elseif not hadState then
+    say("Usage: cityfleet <slot> [server] [go] | cityfleet status"); return
+  end
+  local home = hadState and pos.x == st.home.x and pos.y == st.home.y and pos.z == st.home.z
+  if b and b:match("^fresh") and (slot or st.off or home) then
+    if hadState and turtle.getItemCount(CHEST) == 0 then
       for _, side in ipairs({ "top", "front" }) do
         local p = peripheral.wrap(side)
         if p and p.getAllStacks then chestAt = side; pickUpChest(); break end
       end
+    end
+    -- the deployer drops my Ender Chest into me: it lands in my first free slot
+    if turtle.getItemCount(CHEST) == 0 then
+      for s = 1, 15 do
+        if turtle.getItemCount(s) > 0 then turtle.select(s); turtle.transferTo(CHEST); break end
+      end
+      turtle.select(1)
     end
     if not turtle.detectDown() then
       say("The job server says start over, but there's nothing under me, so I'm not on my depot spot. Put me on it facing north and turn me off and on.")

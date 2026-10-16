@@ -21,6 +21,12 @@ server. Built for Minecraft 1.6.4 with OpenPeripherals, EnderStorage and Applied
   could leave a turtle facing the wrong way; pausing first avoids it.)
 - **`citysupply`** (computer at home): keeps every turtle's Ender Chest stocked from AE with exactly
   what its next ~640 placements need, plus coal blocks, and sends everything else back.
+- **`citydeploy`** (one turtle at home): the **Deploy fleet** button on the page sends it out to put
+  the fleet from its chest on the free depot spots, facing north, each with an Ender Chest, and turn
+  them on; cityfleet (v1.16+) then starts fresh as that spot's slot by itself. Every fleet turtle
+  needs cityfleet installed and run once by hand; after that, pick it up and put it in the chest.
+- **`citysign`**: the program on each Skyline Metro sign gantry's floppy (cityfleet writes it there):
+  draws the sign once, then sleeps until the monitor changes.
 - **`citybuild`**: the older single-building version of the turtle program (no server).
 
 ## Install (in game, with the `get` program)
@@ -53,6 +59,15 @@ private or public, the same as the turtles' chests).
 ```
 get https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/<commit>/citysupply citysupply
 citysupply
+```
+
+Deployer: any turtle on a home spot with a block under it and nothing above, facing north, a
+(double) chest of fleet turtles on its left (west), a chest of their Ender Chests on its right (east),
+coal blocks in its slot 16.
+
+```
+get https://raw.githubusercontent.com/landonracer109/SkylineCity-CC/<commit>/citydeploy citydeploy
+citydeploy <x> <y> <z>
 ```
 
 ## Tools

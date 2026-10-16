@@ -25,7 +25,16 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
                                                from its depot spot (claims dropped, finished jobs kept). For
                                                that many minutes (default 30) a turtle that boots, or waits at
                                                home, gets "fresh" from /boot and starts over by itself
-  GET  /city/boot?t=<label>                 -> "fresh" (start over from my depot spot) or "go" (carry on)
+  GET  /city/boot?t=<label>[&id=<computer id>] -> "fresh" (start over from my depot spot), "fresh <slot>" (the
+                                               deployer just put me on that slot: start fresh as it) or "go"
+  POST /city/deploy  (X-Key)  body [minutes] -> the Deploy fleet button: like Restart turtles (every turtle starts
+                                               again from a depot spot, finished jobs kept), and the deployer
+                                               turtle (citydeploy) puts the fleet out on the free depot spots
+  GET  /city/deploy?t=<label>               -> for the deployer: "idle", or "go" + "slot n x y z" lines (every depot
+                                               spot, slot 1 up to DEPOT_SLOTS) + "used n" lines (filled this round)
+  POST /city/deploy/placed?slot=n&id=<id>   -> the deployer put the turtle with that computer id on slot n (sent
+                                               before it turns the turtle on); its /boot then answers "fresh n"
+  POST /city/deploy/done  body: a message   -> the deployer is finished (out of turtles or spots)
 A turtle that never said hello to the build the server has now (left from an earlier build, or from
 before Restart turtles) gets "pause" to its reports, plus "restart" while a restart is on.
   GET  /city/check?t=<label>&x=<x>          -> "check <steps>" (start the position check), "wait <s> <why>",
@@ -82,6 +91,7 @@ DEPOT_X0 = int(os.environ.get("DEPOT_X0", "-858"))  # world x of slot 1
 DEPOT_STEP = int(os.environ.get("DEPOT_STEP", "8"))
 DEPOT_ROW = int(os.environ.get("DEPOT_ROW", "0"))           # slots per row (0: all in one row)
 DEPOT_ROWSTEP = int(os.environ.get("DEPOT_ROWSTEP", "8"))   # z from one row to the next
+DEPOT_SLOTS = int(os.environ.get("DEPOT_SLOTS", "32"))      # depot spots the deployer may fill
 # The flying area beyond the city: a margin round it, and the depot strip along the south edge.
 MARGIN, SOUTH = 2, 24
 CHECK = json.loads(os.environ["CHECK"]) if os.environ.get("CHECK") else None   # the position check (see above)
@@ -195,6 +205,9 @@ class City:
         self.stockAt = s.get("stockAt", 0)
         self.release = s.get("release")          # {"v": "v1.11", "commit": sha}: turtles update to it
         self.restartUntil = s.get("restartUntil", 0)   # Restart turtles button: fresh starts allowed until then
+        # Deploy fleet button: {"on": bool, "at": t, "slots": {"n": {"id": computer id, "at": t, "started": bool}},
+        # "msg": the deployer's last word}
+        self.deploy = s.get("deploy", {"on": False, "slots": {}})
         dflt = [z for z in os.environ.get("ZONES", "").replace(",", " ").split() if z in self.zones] or self.zones[:1]
         self.zonesOpen = [z for z in s.get("zonesOpen", dflt) if z in self.zones]   # zoned build: where turtles may work
 
@@ -205,7 +218,7 @@ class City:
             json.dump({"done": sorted(self.done), "claims": self.claims, "homes": self.homes,
                        "reports": self.reports, "doneAt": self.doneAt, "paused": self.paused,
                        "stock": self.stock, "stockAt": self.stockAt, "release": self.release,
-                       "zonesOpen": self.zonesOpen, "restartUntil": self.restartUntil}, f)
+                       "zonesOpen": self.zonesOpen, "restartUntil": self.restartUntil, "deploy": self.deploy}, f)
         os.replace(tmp, self.path())
 
     # ---- routing ----
@@ -610,7 +623,10 @@ class City:
         return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": self.laneY, "zones": zones,
                 "doneCount": len(self.done), "jobCount": len(self.order), "jobs": jobs, "names": self.names,
                 "origin": self.O, "span": [self.spanX, self.spanZ], "placed": placed, "rate": rate,
-                "paused": self.paused, "release": self.release, "restartLeft": max(0, int(self.restartUntil - now)), "stockAge": int(now - self.stockAt) if self.stockAt else None}
+                "paused": self.paused, "release": self.release, "restartLeft": max(0, int(self.restartUntil - now)), "stockAge": int(now - self.stockAt) if self.stockAt else None,
+                "deploy": {"on": self.deploy.get("on", False), "placed": len(self.deploy.get("slots", {})),
+                           "started": sum(1 for v in self.deploy.get("slots", {}).values() if v.get("started")),
+                           "msg": self.deploy.get("msg", "")}}
 
 
 city = City()
@@ -618,6 +634,12 @@ city = City()
 
 def qs(url):
     return {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+
+
+def depot_spot(n):
+    """World x, y, z of depot slot n (1 up)."""
+    row, col = divmod(n - 1, DEPOT_ROW) if DEPOT_ROW else (0, n - 1)
+    return [DEPOT_X0 + DEPOT_STEP * col, city.O[1], DEPOT_Z + DEPOT_ROWSTEP * row]
 
 
 class H(BaseHTTPRequestHandler):
@@ -636,8 +658,7 @@ class H(BaseHTTPRequestHandler):
             with lock:
                 if path == "/city/hello":
                     label, n = q["t"], int(q["n"])
-                    row, col = divmod(n - 1, DEPOT_ROW) if DEPOT_ROW else (0, n - 1)
-                    home = [DEPOT_X0 + DEPOT_STEP * col, city.O[1], DEPOT_Z + DEPOT_ROWSTEP * row]
+                    home = depot_spot(n)
                     city.homes[label] = home
                     city.save()
                     return self.reply(200, "home %d %d %d\n" % tuple(home))
@@ -646,6 +667,13 @@ class H(BaseHTTPRequestHandler):
                         return self.reply(200, city.check_result(q["t"], int(q["x"]), int(q["z"]), q["e"]) + "\n")
                     return self.reply(200, city.check_start(q["t"], int(q["x"])) + "\n")
                 if path == "/city/boot":
+                    # put out by the deployer (it told me the computer id and the slot first): fresh as that slot
+                    cid = q.get("id", "")
+                    for n, v in city.deploy.get("slots", {}).items():
+                        if str(v.get("id")) == cid and not v.get("started"):
+                            v["started"] = True
+                            city.save()
+                            return self.reply(200, "fresh %s\n" % n)
                     # a turtle starting up: start over from its depot spot if a restart is on and it hasn't yet
                     fresh = q["t"] not in city.homes and time.time() < city.restartUntil
                     return self.reply(200, "fresh\n" if fresh else "go\n")
@@ -664,6 +692,12 @@ class H(BaseHTTPRequestHandler):
                             with open(f, "rb") as h:
                                 return self.reply(200, h.read())
                     return self.reply(404, "no citysign\n")
+                if path == "/city/deploy":
+                    if not city.deploy.get("on"):
+                        return self.reply(200, "idle\n")
+                    lines = ["go"] + ["slot %d %d %d %d" % ((n,) + tuple(depot_spot(n))) for n in range(1, DEPOT_SLOTS + 1)]
+                    lines += ["used %s" % n for n in sorted(city.deploy.get("slots", {}), key=int)]
+                    return self.reply(200, "\n".join(lines) + "\nend\n")
                 if path == "/city/done":
                     city.finish(q["t"], q["job"])
                     return self.reply(200, "ok\n")
@@ -714,6 +748,17 @@ class H(BaseHTTPRequestHandler):
                 if rel and r.get("version") != rel["v"]:
                     ans += "update %s %s\n" % (rel["v"], rel["commit"])
                 return self.reply(200, ans)
+            if path == "/city/deploy/placed":
+                n, cid = q.get("slot", ""), q.get("id", "")
+                if not (n.isdigit() and cid.lstrip("-").isdigit()):
+                    return self.reply(400, "slot=n&id=x\n")
+                city.deploy.setdefault("slots", {})[n] = {"id": int(cid), "at": time.time(), "started": False}
+                city.save()
+                return self.reply(200, "ok\n")
+            if path == "/city/deploy/done":
+                city.deploy["on"], city.deploy["msg"] = False, body.strip()[:200]
+                city.save()
+                return self.reply(200, "ok\n")
             if path == "/city/stock":
                 # the supply computer's AE counts: "id:dmg n" per line
                 for line in body.splitlines():
@@ -748,14 +793,19 @@ class H(BaseHTTPRequestHandler):
                 city.paused = path == "/city/pause"
                 city.save()
                 return self.reply(200, ("paused" if city.paused else "running") + "\n")
-            if path == "/city/restart":
+            if path in ("/city/restart", "/city/deploy"):
                 if not KEY or self.headers.get("X-Key") != KEY:
                     return self.reply(403, "wrong password\n")
-                mins = int(body.strip()) if body.strip().isdigit() else 30
-                city.homes, city.claims, city.paused = {}, {}, False
+                mins = int(body.strip()) if body.strip().isdigit() else (60 if path == "/city/deploy" else 30)
+                city.homes, city.claims = {}, {}
+                if path == "/city/restart":
+                    city.paused = False
+                else:
+                    # (Deploy fleet keeps Pause as it is: press Resume when ready)
+                    city.deploy = {"on": True, "at": time.time(), "slots": {}, "msg": ""}
                 city.restartUntil = time.time() + 60 * mins
                 city.save()
-                return self.reply(200, "restart %d\n" % mins)
+                return self.reply(200, "%s %d\n" % (path.rsplit("/", 1)[1], mins))
             if path == "/city/reset":
                 if not KEY or self.headers.get("X-Key") != KEY:
                     return self.reply(403, "no\n")

@@ -1,0 +1,293 @@
+-- citydeploy: the Skyline City deployer. One ComputerCraft 1.63 turtle at home that, when the job
+-- server's Deploy fleet button is pressed, puts the fleet out: each turtle on a free depot spot,
+-- facing north, with an Ender Chest dropped into it, then turned on. Before turning one on I tell the
+-- server its computer id and spot, so cityfleet (v1.16+) starts fresh as that slot by itself.
+-- Turtles keep their files when picked up, so every fleet turtle needs cityfleet installed (and run)
+-- once by hand; after that it only needs picking up and putting in my chest.
+--
+-- Setup: my home spot has a block under it and nothing above it. Facing NORTH, a (double) chest on
+-- my LEFT (west) holds the fleet turtles and one on my RIGHT (east) their Ender Chests (any colours:
+-- citysupply pairs home chests by colour). Coal blocks in my slot 16 for my own fuel.
+--   citydeploy <x> <y> <z> [server]   first start, on my home spot facing north (F3 coordinates)
+--   citydeploy                        carries on (runs from startup by itself)
+-- Then I wait. Deploy fleet on the page: I take up to 7 turtles and 7 chests at a time, fly at 3 above
+-- the depot spots, fill the free ones in slot order (a spot with something on it is skipped), and come
+-- back for more until I run out of turtles, chests or spots. I never dig anything.
+
+local args = { ... }
+local VERSION = "v1.00"
+local CFG_FILE, STATE_FILE = "citydeploy.cfg", "citydeploy.state"
+local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
+local FUEL, MIN_FUEL = 16, 1000
+local BATCH = 7                       -- turtles in slots 1-7, their chests in 8-14
+local DX = { [0] = 1, 0, -1, 0 }      -- facing: 0 +x (east), 1 +z (south), 2 -x (west), 3 -z (north)
+local DZ = { [0] = 0, 1, 0, -1 }
+
+local function readFile(name)
+  local h = fs.open(name, "r"); if not h then return nil end
+  local s = h.readAll(); h.close(); return s
+end
+local function writeFile(name, s) local h = fs.open(name, "w"); h.write(s); h.close() end
+
+local cfg, st
+local function save() writeFile(STATE_FILE, textutils.serialize(st)) end
+local function say(msg) print(msg); if st then st.msg = msg end end
+
+local function get(path)
+  local ok, r = pcall(http.get, cfg.server .. path)
+  if not ok or not r then return nil end
+  local s = r.readAll(); r.close(); return s
+end
+local function post(path, body)
+  local ok, r = pcall(http.post, cfg.server .. path, body or "")
+  if not ok or not r then return nil end
+  local s = r.readAll(); r.close(); return s
+end
+-- keep trying (the server may restart): these must arrive
+local function postSure(path, body)
+  for _ = 1, 60 do
+    local r = post(path, body)
+    if r and r:match("^ok") then return true end
+    sleep(5)
+  end
+  return false
+end
+
+---------------------------------------------------------------------------------------------------
+-- moving: plain moves only (nothing is ever dug); another turtle in the way is waited for. A move
+-- whose answer a restart lost is recovered from the fuel count, like cityfleet.
+
+local function refuel()
+  if turtle.getFuelLevel() == "unlimited" or turtle.getFuelLevel() >= MIN_FUEL then return end
+  turtle.select(FUEL)
+  while turtle.getFuelLevel() < MIN_FUEL and turtle.getItemCount(FUEL) > 0 do turtle.refuel(1) end
+  if turtle.getFuelLevel() < 100 then
+    say("I'm out of fuel: put coal blocks in my slot 16.")
+    while turtle.getFuelLevel() < 100 do sleep(10); turtle.select(FUEL); turtle.refuel(1) end
+  end
+end
+
+local function turnTo(f)
+  while st.pos.f ~= f do
+    if (st.pos.f + 1) % 4 == f then turtle.turnRight(); st.pos.f = f
+    else turtle.turnLeft(); st.pos.f = (st.pos.f + 3) % 4 end
+    save()
+  end
+end
+
+local function step(dir)
+  refuel()
+  local p = st.pos
+  local nx, ny, nz = p.x, p.y, p.z
+  local move, detect, side = turtle.forward, turtle.detect, "front"
+  if dir == "up" then ny, move, detect, side = ny + 1, turtle.up, turtle.detectUp, "top"
+  elseif dir == "down" then ny, move, detect, side = ny - 1, turtle.down, turtle.detectDown, "bottom"
+  else nx, nz = nx + DX[p.f], nz + DZ[p.f] end
+  st.pend = { fuel = turtle.getFuelLevel(), x = nx, y = ny, z = nz }
+  save()
+  local since = os.clock()
+  while not move() do
+    if detect() and peripheral.getType(side) ~= "turtle" and os.clock() - since > 60 then
+      error(string.format("Something is in my way at %d,%d,%d; please clear it.", nx, ny, nz))
+    end
+    sleep(1 + math.random())
+  end
+  p.x, p.y, p.z, st.pend = nx, ny, nz, nil
+  save()
+end
+
+local function goTo(x, y, z)
+  while st.pos.y < y do step("up") end
+  if st.pos.x ~= x then turnTo(x > st.pos.x and 0 or 2) end
+  while st.pos.x ~= x do step("forward") end
+  if st.pos.z ~= z then turnTo(z > st.pos.z and 1 or 3) end
+  while st.pos.z ~= z do step("forward") end
+  while st.pos.y > y do step("down") end
+end
+
+-- out of my home spot and back: straight up to the flying height and down again
+local function flyTo(x, y, z, high)
+  goTo(st.pos.x, high, st.pos.z)
+  goTo(x, high, z)
+  goTo(x, y, z)
+end
+
+---------------------------------------------------------------------------------------------------
+-- deploying
+
+local bad = {}        -- slots holding something that won't place (taken home again)
+local function carrying()
+  local n = 0
+  for s = 1, BATCH do if turtle.getItemCount(s) > 0 and not bad[s] then n = n + 1 end end
+  return n
+end
+
+-- at home facing north: take up to 7 turtles (left chest) and as many Ender Chests (right chest)
+local function load()
+  turnTo(2)
+  local t = 0
+  for s = 1, BATCH do
+    if turtle.getItemCount(s) == 0 then turtle.select(s); if not turtle.suck() then break end end
+  end
+  for s = 1, BATCH do if turtle.getItemCount(s) > 0 then t = t + 1 end end
+  turnTo(0)
+  for s = 1, BATCH do
+    if turtle.getItemCount(s) > 0 and turtle.getItemCount(s + BATCH) == 0 then turtle.select(s + BATCH); turtle.suck(1) end
+  end
+  -- a turtle without a chest goes back
+  turnTo(2)
+  for s = 1, BATCH do
+    if turtle.getItemCount(s) > 0 and turtle.getItemCount(s + BATCH) == 0 then turtle.select(s); turtle.drop() end
+  end
+  turnTo(3)
+  return carrying()
+end
+
+-- back home: whatever is left goes back in the chests
+local function unload()
+  turnTo(2)
+  for s = 1, BATCH do if turtle.getItemCount(s) > 0 then turtle.select(s); turtle.drop() end end
+  turnTo(0)
+  for s = BATCH + 1, 2 * BATCH do if turtle.getItemCount(s) > 0 then turtle.select(s); turtle.drop() end end
+  turnTo(3)
+end
+
+-- one above spot n: put the turtle from slot s there (facing north, like me), tell the server, give it
+-- its chest, turn it on. st.cur keeps where I am in this, for a restart.
+local function placeOne(n, spot, s)
+  local x, y, z = spot[1], spot[2], spot[3]
+  st.cur = { n = n, s = s, x = x, y = y, z = z }
+  save()
+  flyTo(x, y + 1, z, st.high)
+  turnTo(3)
+  -- anything on the spot (another turtle, a block): not mine to use
+  turtle.select(s)
+  if turtle.detectDown() then st.cur = nil; save(); return "taken" end
+  if not turtle.placeDown() then st.cur = nil; save(); return "bad" end     -- not a turtle?
+  st.cur.placed = true; save()
+  local ok, id = pcall(peripheral.call, "bottom", "getID")
+  if not ok or type(id) ~= "number" or id < 0 then
+    -- a turtle that has never been on has no id yet: it can't have cityfleet either
+    say(string.format("The turtle on spot %d has never been used (no computer id): install cityfleet on it once by hand.", n))
+  else
+    postSure(string.format("/deploy/placed?slot=%d&id=%d", n, id))
+  end
+  if turtle.getItemCount(s + BATCH) > 0 then turtle.select(s + BATCH); turtle.dropDown(1) end
+  pcall(peripheral.call, "bottom", "turnOn")
+  st.cur = nil
+  save()
+  return "placed", id
+end
+
+local function deploy(reply)
+  local spots, used = {}, {}
+  for line in reply:gmatch("[^\n]+") do
+    local n, x, y, z = line:match("^slot (%d+) (%-?%d+) (%-?%d+) (%-?%d+)")
+    if n then spots[#spots + 1] = { n = tonumber(n), tonumber(x), tonumber(y), tonumber(z) } end
+    local u = line:match("^used (%d+)"); if u then used[tonumber(u)] = true end
+  end
+  local skip = st.skip or {}
+  st.high = math.max(spots[1][2], cfg.home.y) + 3       -- flying height: over the turtles and their chests
+  save()
+  local placed, nextI, trip = 0, 1, nil
+  while true do
+    if carrying() == 0 then
+      flyTo(cfg.home.x, cfg.home.y, cfg.home.z, st.high)
+      unload(); bad = {}
+      if trip == placed then return string.format("the rest of my chest won't place (not turtles?): %d placed", placed) end
+      trip = placed
+      if load() == 0 then
+        return string.format("out of turtles or Ender Chests: %d placed", placed)
+      end
+    end
+    for s = 1, BATCH do
+      if turtle.getItemCount(s) > 0 and not bad[s] then
+        while nextI <= #spots and (used[spots[nextI].n] or skip[spots[nextI].n]) do nextI = nextI + 1 end
+        if nextI > #spots then
+          flyTo(cfg.home.x, cfg.home.y, cfg.home.z, st.high); unload()
+          return string.format("no free depot spots left: %d placed", placed)
+        end
+        local sp = spots[nextI]
+        local r, id = placeOne(sp.n, sp, s)
+        if r == "placed" then placed = placed + 1; used[sp.n] = true; print(string.format("Spot %d: turtle %s.", sp.n, tostring(id)))
+        elseif r == "bad" then bad[s] = true; print(string.format("The item in my slot %d won't place: taking it back.", s))
+        else skip[sp.n] = true; st.skip = skip; save(); print(string.format("Spot %d is taken.", sp.n)) end
+      end
+    end
+  end
+end
+
+---------------------------------------------------------------------------------------------------
+-- main
+
+local c = readFile(CFG_FILE)
+cfg = c and textutils.unserialize(c)
+if args[1] then
+  local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
+  if not (x and y and z) then print("Usage: citydeploy <x> <y> <z> [server]   (my home spot, facing north)"); return end
+  cfg = { home = { x = x, y = y, z = z }, server = (args[4] or DEFAULT_SERVER):gsub("/$", "") }
+  writeFile(CFG_FILE, textutils.serialize(cfg))
+  st = { pos = { x = x, y = y, z = z, f = 3 } }
+  save()
+  os.setComputerLabel(os.getComputerLabel() or "deployer")
+else
+  if not cfg then print("Usage: citydeploy <x> <y> <z> [server]   (my home spot, facing north)"); return end
+  local s = readFile(STATE_FILE)
+  st = s and textutils.unserialize(s)
+  if type(st) ~= "table" or not st.pos then print("No saved state: start me with citydeploy <x> <y> <z>"); return end
+  if st.pend then
+    if turtle.getFuelLevel() == st.pend.fuel - 1 then st.pos.x, st.pos.y, st.pos.z = st.pend.x, st.pend.y, st.pend.z end
+    st.pend = nil
+    save()
+  end
+end
+if not fs.exists("startup") then writeFile("startup", 'shell.run("citydeploy")\n') end
+print(string.format("citydeploy %s at %d,%d,%d; home %d,%d,%d; server %s", VERSION, st.pos.x, st.pos.y, st.pos.z,
+  cfg.home.x, cfg.home.y, cfg.home.z, cfg.server))
+
+local function run()
+  -- a turtle I had placed but not yet started when I stopped: finish it (placed: it's gone from my slot)
+  if st.cur and (st.cur.placed or turtle.getItemCount(st.cur.s) == 0) then
+    local cur = st.cur
+    flyTo(cur.x, cur.y + 1, cur.z, st.high or cur.y + 3)
+    if peripheral.getType("bottom") == "turtle" then
+      local ok, id = pcall(peripheral.call, "bottom", "getID")
+      if ok and type(id) == "number" and id >= 0 then postSure(string.format("/deploy/placed?slot=%d&id=%d", cur.n, id)) end
+      if turtle.getItemCount(cur.s + BATCH) > 0 then turtle.select(cur.s + BATCH); turtle.dropDown(1) end
+      pcall(peripheral.call, "bottom", "turnOn")
+    end
+    st.cur = nil; save()
+  end
+  st.cur = nil
+  local idle = false
+  while true do
+    local r = get("/deploy?t=" .. (os.getComputerLabel() or "deployer"))
+    if r and r:match("^go") and r:match("\nend") then
+      say("Deploying the fleet.")
+      local msg = deploy(r)
+      flyTo(cfg.home.x, cfg.home.y, cfg.home.z, st.high)
+      unload()
+      st.skip = nil; save()
+      say("Done: " .. msg)
+      postSure("/deploy/done", msg)
+      idle = false
+    else
+      if not idle then print("Waiting for Deploy fleet on the city page."); idle = true end
+      -- home, facing north, between deploys
+      if st.pos.x ~= cfg.home.x or st.pos.y ~= cfg.home.y or st.pos.z ~= cfg.home.z then
+        flyTo(cfg.home.x, cfg.home.y, cfg.home.z, st.high or cfg.home.y + 3); unload()
+      end
+      sleep(20)
+    end
+  end
+end
+
+local ok, err = pcall(run)
+if not ok then
+  if err == "Terminated" then print("Stopped (Ctrl+T). Run citydeploy to carry on."); return end
+  print("ERROR: " .. tostring(err))
+  pcall(post, "/deploy/done", "ERROR: " .. tostring(err))
+  print("Restarting in 60 s. Ctrl+T to stop.")
+  sleep(60)
+  os.reboot()
+end

@@ -47,15 +47,16 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .top .spacer { flex: 1; }
 button.pause { font: inherit; font-weight: 600; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 7px; padding: 6px 14px; cursor: pointer; }
 button.pause.on { background: var(--building); color: #1b1305; border-color: var(--building); }
-#banner, #rbanner { display: none; margin-top: 10px; padding: 8px 12px; border-radius: 7px; background: var(--building); color: #1b1305; font-weight: 600; }
+#banner, #rbanner, #dbanner { display: none; margin-top: 10px; padding: 8px 12px; border-radius: 7px; background: var(--building); color: #1b1305; font-weight: 600; }
 .wrap { overflow-x: auto; }
 </style>
 </head>
 <body>
 <main>
   <section class="panel">
-    <div class="top"><h1>Skyline City</h1><span class="sub" id="when">loading…</span><span class="spacer"></span><button class="pause" id="restartBtn" hidden>Restart turtles</button><button class="pause" id="pauseBtn" hidden>Pause</button></div>
+    <div class="top"><h1>Skyline City</h1><span class="sub" id="when">loading…</span><span class="spacer"></span><button class="pause" id="deployBtn" hidden>Deploy fleet</button><button class="pause" id="restartBtn" hidden>Restart turtles</button><button class="pause" id="pauseBtn" hidden>Pause</button></div>
     <div id="banner">PAUSED: the turtles stop at a safe spot within a minute and wait. Leave once every turtle shows Paused.</div>
+    <div id="dbanner"></div>
     <div id="rbanner">RESTART: put each turtle on its depot spot facing north and turn it on (turtles already home start by themselves). <span id="rleft"></span></div>
     <div class="bar" style="margin-top:10px"><i id="allbar" style="width:0"></i></div>
     <div class="stats">
@@ -164,7 +165,12 @@ function render() {
   btn.hidden = false; btn.textContent = S.paused ? "Resume" : "Pause"; btn.classList.toggle("on", !!S.paused);
   document.getElementById("banner").style.display = S.paused ? "block" : "none";
   document.getElementById("restartBtn").hidden = false;
-  document.getElementById("rbanner").style.display = S.restartLeft ? "block" : "none";
+  document.getElementById("deployBtn").hidden = false;
+  const D = S.deploy || {}, db = document.getElementById("dbanner");
+  db.style.display = D.on || (D.msg && S.restartLeft) ? "block" : "none";
+  db.textContent = D.on ? `DEPLOYING: the deployer is putting the fleet on the depot spots (${D.placed} placed, ${D.started} started).`
+    : `Deploy finished: ${D.msg} (${D.placed} placed, ${D.started} started).`;
+  document.getElementById("rbanner").style.display = S.restartLeft && !D.on && !D.msg ? "block" : "none";
   document.getElementById("rleft").textContent = S.restartLeft ? Math.ceil(S.restartLeft / 60) + " min left." : "";
   const byId = Object.fromEntries(S.jobs.map(j => [j[0], j]));
   const rows = Object.entries(S.reports).filter(([t]) => t !== "supply").sort((a, b) => (+a[0].replace(/\D/g, "")) - (+b[0].replace(/\D/g, "")));
@@ -218,20 +224,24 @@ async function togglePause() {
   load();
 }
 document.getElementById("pauseBtn").addEventListener("click", togglePause);
-// Restart turtles: every turtle starts over from its depot spot (finished jobs are kept)
-document.getElementById("restartBtn").addEventListener("click", async () => {
-  if (!confirm("Restart every turtle? Each one stops where it is. Turtles at home start over by themselves; put the others on their depot spots facing north and turn them on (within 30 minutes). Finished jobs are kept.")) return;
+// Restart turtles / Deploy fleet (same password): every turtle starts over from a depot spot (finished jobs kept)
+async function keyed(path, body, question) {
+  if (!confirm(question)) return;
   let key = null;
   try { key = localStorage.getItem("cityKey"); } catch (e) {}
   for (let tries = 0; tries < 2; tries++) {
     if (!key) { key = prompt("Password:"); if (!key) return; }
-    const r = await fetch(location.pathname.replace(/\/$/, "") + "/restart", { method: "POST", headers: { "X-Key": key }, body: "30" });
+    const r = await fetch(location.pathname.replace(/\/$/, "") + path, { method: "POST", headers: { "X-Key": key }, body });
     if (r.status === 403) { try { localStorage.removeItem("cityKey"); } catch (e) {} key = null; alert("Wrong password."); continue; }
     try { localStorage.setItem("cityKey", key); } catch (e) {}
     break;
   }
   load();
-});
+}
+document.getElementById("restartBtn").addEventListener("click", () => keyed("/restart", "30",
+  "Restart every turtle? Each one stops where it is. Turtles at home start over by themselves; put the others on their depot spots facing north and turn them on (within 30 minutes). Finished jobs are kept."));
+document.getElementById("deployBtn").addEventListener("click", () => keyed("/deploy", "60",
+  "Deploy the fleet? Every turtle still out stops where it is (pick those up first). The deployer then puts the turtles from its chest on the free depot spots, each with an Ender Chest, and starts them. Pause stays as it is. Finished jobs are kept."));
 // Open the next zone (same password)
 document.getElementById("zones").addEventListener("click", async ev => {
   const b = ev.target.closest("button[data-zone]"); if (!b || !S) return;
