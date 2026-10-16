@@ -19,6 +19,13 @@ Plain-text answers so CC 1.63 can read them line by line. Only the standard libr
   POST /city/pause, /city/resume  (X-Key)   -> every turtle stops at a safe point / carries on
                                                (reports are answered "pause" while paused)
   POST /city/reset  (X-Key)                 -> forget all progress (for tests)
+  POST /city/restart  (X-Key)  body [minutes] -> the Restart turtles button: every turtle has to start again
+                                               from its depot spot (claims dropped, finished jobs kept). For
+                                               that many minutes (default 30) a turtle that boots, or waits at
+                                               home, gets "fresh" from /boot and starts over by itself
+  GET  /city/boot?t=<label>                 -> "fresh" (start over from my depot spot) or "go" (carry on)
+A turtle that never said hello to the build the server has now (left from an earlier build, or from
+before Restart turtles) gets "pause" to its reports, plus "restart" while a restart is on.
   GET  /city/check?t=<label>&x=<x>          -> "check <steps>" (start the position check), "wait <s> <why>",
                                                or "none" (no check configured)
   GET  /city/check?t=<label>&x=&z=&e=       -> "ok" or "bad <why>": what the turtle found flying north
@@ -183,6 +190,7 @@ class City:
         self.stock = s.get("stock", {})          # "id:dmg" -> how many AE has (from the supply computer)
         self.stockAt = s.get("stockAt", 0)
         self.release = s.get("release")          # {"v": "v1.11", "commit": sha}: turtles update to it
+        self.restartUntil = s.get("restartUntil", 0)   # Restart turtles button: fresh starts allowed until then
         dflt = [z for z in os.environ.get("ZONES", "").replace(",", " ").split() if z in self.zones] or self.zones[:1]
         self.zonesOpen = [z for z in s.get("zonesOpen", dflt) if z in self.zones]   # zoned build: where turtles may work
 
@@ -193,7 +201,7 @@ class City:
             json.dump({"done": sorted(self.done), "claims": self.claims, "homes": self.homes,
                        "reports": self.reports, "doneAt": self.doneAt, "paused": self.paused,
                        "stock": self.stock, "stockAt": self.stockAt, "release": self.release,
-                       "zonesOpen": self.zonesOpen}, f)
+                       "zonesOpen": self.zonesOpen, "restartUntil": self.restartUntil}, f)
         os.replace(tmp, self.path())
 
     # ---- routing ----
@@ -596,7 +604,7 @@ class City:
         return {"kinds": kinds, "claims": self.claims, "reports": reports, "lanes": self.laneY, "zones": zones,
                 "doneCount": len(self.done), "jobCount": len(self.order), "jobs": jobs, "names": self.names,
                 "origin": self.O, "span": [self.spanX, self.spanZ], "placed": placed, "rate": rate,
-                "paused": self.paused, "release": self.release, "stockAge": int(now - self.stockAt) if self.stockAt else None}
+                "paused": self.paused, "release": self.release, "restartLeft": max(0, int(self.restartUntil - now)), "stockAge": int(now - self.stockAt) if self.stockAt else None}
 
 
 city = City()
@@ -631,6 +639,10 @@ class H(BaseHTTPRequestHandler):
                     if "e" in q:
                         return self.reply(200, city.check_result(q["t"], int(q["x"]), int(q["z"]), q["e"]) + "\n")
                     return self.reply(200, city.check_start(q["t"], int(q["x"])) + "\n")
+                if path == "/city/boot":
+                    # a turtle starting up: start over from its depot spot if a restart is on and it hasn't yet
+                    fresh = q["t"] not in city.homes and time.time() < city.restartUntil
+                    return self.reply(200, "fresh\n" if fresh else "go\n")
                 if path == "/city/next":
                     return self.reply(200, city.next(q["t"], int(q["x"]), int(q["y"]), int(q["z"])) + "\n")
                 if path.startswith("/city/plan/"):
@@ -678,9 +690,13 @@ class H(BaseHTTPRequestHandler):
                     if k:
                         r[k] = v
                 r["at"] = time.time()
-                city.reports[q.get("t", "?")] = r
+                label = q.get("t", "?")
+                city.reports[label] = r
                 city.save()
                 ans = "pause\n" if city.paused else "ok\n"    # turtles stop while paused
+                if label not in city.homes and label != "supply":
+                    # not started for this build: stay put (and start over, if at home, while a restart is on)
+                    ans = "pause\n" + ("restart\n" if time.time() < city.restartUntil else "")
                 rel = city.release
                 if rel and r.get("version") != rel["v"]:
                     ans += "update %s %s\n" % (rel["v"], rel["commit"])
@@ -719,6 +735,14 @@ class H(BaseHTTPRequestHandler):
                 city.paused = path == "/city/pause"
                 city.save()
                 return self.reply(200, ("paused" if city.paused else "running") + "\n")
+            if path == "/city/restart":
+                if not KEY or self.headers.get("X-Key") != KEY:
+                    return self.reply(403, "wrong password\n")
+                mins = int(body.strip()) if body.strip().isdigit() else 30
+                city.homes, city.claims, city.paused = {}, {}, False
+                city.restartUntil = time.time() + 60 * mins
+                city.save()
+                return self.reply(200, "restart %d\n" % mins)
             if path == "/city/reset":
                 if not KEY or self.headers.get("X-Key") != KEY:
                     return self.reply(403, "no\n")

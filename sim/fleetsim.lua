@@ -16,6 +16,11 @@
 -- PREDONE (job ids) are built before the start (blocks placed, marked done on the server);
 -- ZONES_AUTO=1 opens the next zone (POST /zones) ZONE_DELAY s (default 300) after a turtle is first
 -- told to wait for one. DEPOT_ROW / DEPOT_ROWSTEP: the depot in rows (like citysrv).
+-- RESTART=<s>: the Restart turtles button is pressed then; 10 minutes later every turtle that switched
+-- itself off is picked up (with its Ender Chest), put on its depot spot facing north and turned on.
+-- RESTART_CRASH=1: the Minecraft server restarts 5 s after the button (turtles reboot where they are).
+-- RESTART_DONE=1: when everything is built, reset the server and press Restart: the turtles at home
+-- must build it all again by themselves.
 
 local JOBS, N, RESTARTS, SEED, HOURS = arg[1], tonumber(arg[2] or 4), tonumber(arg[3] or 3), tonumber(arg[4] or 1), tonumber(arg[5] or 30)
 local SERVER = os.getenv("SERVER") or "http://127.0.0.1:8097/city"
@@ -494,7 +499,7 @@ local function envFor(T)
   E.sleep = function(n) if restartDue(T) then coroutine.yield("KILL") end; act(T, n) end
   E.read = function() return "" end
   E.os = setmetatable({ day = function() return 1 end, time = function() return 12 end, clock = function() return T.clock - T.boot end,
-    setComputerLabel = function() end, reboot = function() coroutine.yield("KILL") end }, { __index = os })
+    setComputerLabel = function() end, reboot = function() coroutine.yield("KILL") end, shutdown = function() coroutine.yield("OFF") end }, { __index = os })
   E.textutils = textutils
   E.print = function(s)
     s = tostring(s)
@@ -575,10 +580,50 @@ if ZONES_AUTO then
   zoneAll, zoneN = zonesOpen, 1
 end
 local ended = "time limit"
+local RESTART, RESTART_CRASH, RESTART_DONE = tonumber(os.getenv("RESTART") or ""), os.getenv("RESTART_CRASH") == "1", os.getenv("RESTART_DONE") == "1"
+local placeAt, restartLog = nil, {}
+local function pressRestart(at)
+  assert(postBody("/restart", "30", true):match("^restart"), "restart refused")
+  restartLog[#restartLog + 1] = string.format("Restart pressed at %.2f h", at / 3600)
+  for _, t in ipairs(turtles) do t.finished = false end
+  placeAt = at + 600
+end
+-- the player puts every switched-off turtle back on its depot spot (with its Ender Chest) and turns it on
+local function placeTurtles()
+  local n = 0
+  for _, t in ipairs(turtles) do
+    if t.off then
+      if not t.inv[16] then
+        for k, b in pairs(world) do if b.id == ENDER and b.dmg == t.n then world[k] = nil; t.inv[16] = { id = ENDER, dmg = t.n, qty = 1 }; break end end
+      end
+      turtleAt[key(t.x, t.y, t.z)] = nil
+      t.x, t.y, t.z, t.f = t.start[1], t.start[2], t.start[3], 3
+      assert(not turtleAt[key(t.x, t.y, t.z)], "depot spot taken")
+      turtleAt[key(t.x, t.y, t.z)] = t
+      t.off, t.clock = false, math.max(t.clock, placeAt)
+      t.log[#t.log + 1] = string.format("%8.0fs  -- put on its depot spot and turned on --", t.clock)
+      start(t, {})
+      n = n + 1
+    end
+  end
+  restartLog[#restartLog + 1] = string.format("%d turtles put back on their spots at %.2f h", n, placeAt / 3600)
+  placeAt = nil
+end
 while true do
   local T
   for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end
+  if placeAt and (not T or T.clock >= placeAt) then placeTurtles(); T = nil; for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end end
   if not T then ended = "every turtle stopped"; break end
+  if RESTART and T.clock >= RESTART then
+    pressRestart(T.clock); RESTART = nil
+    if RESTART_CRASH then for _, t in ipairs(turtles) do if t.co then t.crashAt = T.clock + 5 end end end
+  end
+  if T.crashAt and T.clock >= T.crashAt then
+    T.crashAt = nil
+    T.log[#T.log + 1] = string.format("%8.0fs  -- Minecraft server restart (rebooted where it is) --", T.clock)
+    T.clock = T.clock + 30
+    start(T, {})
+  end
   clock = T.clock
   if clock - lastAE >= 5 then lastAE = clock; for _, t in ipairs(turtles) do aeFill(t) end end
   -- Pause / Resume
@@ -616,6 +661,13 @@ while true do
   if clock > deadline then break end
   local done = true
   for _, t in ipairs(turtles) do if not t.finished and t.co then done = false end end
+  if done and RESTART_DONE then
+    RESTART_DONE = false
+    assert(postBody("/reset", "", true):match("ok"), "reset refused")
+    pressRestart(clock)
+    placeAt = nil      -- nobody to put back: they're all home
+    done = false
+  end
   if done then ended = "all turtles home, nothing left"; break end
   -- stalled: nothing placed for 2 sim-hours while work is left
   if stats.places ~= (lastPlaces or -1) then lastPlaces, lastPlaceAt = stats.places, clock end
@@ -635,6 +687,10 @@ while true do
     if T.traceFn then T.traceFn("RESTART") end
     T.clock = T.clock + 30
     start(T, {})
+  elseif sig == "OFF" then
+    T.log[#T.log + 1] = string.format("%8.0fs  switched itself off at %d,%d,%d", T.clock, T.x, T.y, T.z)
+    T.co, T.off = nil, true
+    stats.offs = (stats.offs or 0) + 1
   elseif coroutine.status(T.co) == "dead" then
     T.log[#T.log + 1] = string.format("%8.0fs  program ended", T.clock)
     T.co = nil
@@ -689,6 +745,12 @@ if next(STOCKOUT) then
   io.write(string.format("Ender Chest waits logged (\"needs ...\"): %d\n", stuck))
 end
 for _, l in ipairs(zoneLog) do io.write("zone ", l, "\n") end
+for _, l in ipairs(restartLog) do io.write(l, "\n") end
+if #restartLog > 0 then
+  local fresh = 0
+  for _, T in ipairs(turtles) do for _, l in ipairs(T.log) do if l:find("start over", 1, true) or l:find("starting over", 1, true) then fresh = fresh + 1 end end end
+  io.write(string.format("switched off: %d   fresh starts logged: %d\n", stats.offs or 0, fresh))
+end
 io.write(string.format("\nended: %s at %.2f h\nblocks %d  missing %d  wrong %d  extra %d\n", ended, clock / 3600, total, missing, wrong, extra))
 if #mb > 0 then io.write("missing by job: ", table.concat(mb, " "):sub(1, 600), "\n") end
 if relV then

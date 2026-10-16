@@ -24,14 +24,21 @@
 -- in x only across a step of the edge), so check each turtle's x with F3 too.
 -- With nothing to do (the server says wait) I wait up at the wait height, above everything the
 -- build places, straight up from where I finished, so I'm never in another turtle's way (v1.12).
--- When the whole build is done and I'm home, I stop for good (v1.13): a later build, even on the same
--- job server, only starts me again with "cityfleet <slot> go". The server can also tell me to stop
--- ("stop": I wasn't started for the build it has now).
+-- When the whole build is done and I'm home, I stop and wait (v1.13). The server can also tell me to
+-- stop ("stop": I wasn't started for the build it has now); reports from a turtle like that are
+-- answered "pause".
+-- Restart turtles (v1.14, a button on the job server's page): every turtle stops where it is. One
+-- that is home starts over by itself; any other switches itself off: pick it up, put it on its depot
+-- spot facing north and turn it on. On boot I ask the server (/boot); if a restart is on, I switched
+-- myself off for it (or I'm home) and I'm standing on something, I throw away my old state and start
+-- fresh from my depot spot, as if "cityfleet <slot> go" had been typed. No commands to type. (A turtle
+-- that reboots where it is, say after a Minecraft server restart, never switched itself off, so it
+-- carries on from its saved state instead, and gets stopped like the others.)
 -- Travelling, I fly at one height per direction (east, west, south, north each have their own lane
 -- above the streets) so turtles never meet head on.
 
 local args = { ... }
-local VERSION = "v1.13"
+local VERSION = "v1.14"
 local CFG_FILE, STATE_FILE, PLAN_FILE = "cityfleet.cfg", "fleet.state", "fleet.plan"
 local DEFAULT_SERVER = "https://brlink.tailbdc4d5.ts.net/city"
 local CHEST = 16
@@ -223,6 +230,7 @@ end
 
 -- Returns the server's answer: "pause" while the Pause button is on (nil if no report was due).
 local pausing, pauseHere = false, nil   -- (pauseHere is below)
+local restartOffered = false            -- the server's report answer says Restart turtles is on
 local updateTo, updateFailed = nil, {}   -- the release the server announced: { v = "v1.11", commit = sha }
 
 -- At a safe spot: if a new release was announced, fetch it, make sure it's whole, and restart into it.
@@ -267,6 +275,7 @@ local function report(force, msg)
   local answer = reply and reply:match("^(%a+)")
   local v, commit = (reply or ""):match("\nupdate (v[%d%.]+) (%x+)")
   if v and #commit == 40 then updateTo = { v = v, commit = commit } end
+  if reply then restartOffered = reply:find("\nrestart", 1, true) ~= nil end
   if answer == "pause" and not pausing then pauseHere(); answer = "ok" end
   return answer
 end
@@ -281,7 +290,21 @@ pauseHere = function()
   save()
   say("Paused. Waiting for Resume...")
   report(true, "Paused")
-  repeat sleep(15) until report(true, "Paused") ~= "pause"
+  repeat
+    -- Restart turtles: at home I start over (the boot check does it); anywhere else I switch myself
+    -- off, to be picked up, put on my depot spot and turned on
+    if restartOffered then
+      local home = pos.x == st.home.x and pos.y == st.home.y and pos.z == st.home.z
+      if not home then st.off = true end
+      save()
+      report(true, home and "Restart: I'm home, so I'm starting over." or "Restart: switched off. Put me on my depot spot facing north and turn me on.")
+      say(home and "Restart: I'm home, so I'm starting over." or
+        string.format("Restart: pick me up, put me on my depot spot (%d,%d,%d) facing north and turn me on.", st.home.x, st.home.y, st.home.z))
+      sleep(2)
+      if home then os.reboot() else os.shutdown() end
+    end
+    sleep(15)
+  until report(true, "Paused") ~= "pause"
   pausing = false
   tell("Resumed.")
 end
@@ -825,7 +848,10 @@ end
 local function loop()
   while true do
     if st.phase == "check" then checkPosition()
-    elseif st.phase == "stopped" then tell(st.stopped); return
+    elseif st.phase == "stopped" then
+      -- stay stopped, but keep checking in: Restart turtles starts me over (see pauseHere)
+      tell(st.stopped)
+      while true do sleep(60); report(true, st.stopped) end
     elseif st.phase == "ask" then maybeUpdate(); ask()
     elseif st.phase == "go" then
       runLegs()
@@ -877,20 +903,16 @@ for _ = 1, 60 do
 end
 if not self_ then say("I need a Narcissistic upgrade (OpenPeripherals Addons) to see my own inventory."); return end
 
-if args[1] then
-  local slot = tonumber(args[1])
-  if not slot or slot < 1 or slot > 64 then print("Usage: cityfleet <slot> [server] [go]"); return end
-  local server = (args[2] and args[2] ~= "go") and args[2] or DEFAULT_SERVER
-  cfg = { slot = slot, label = "city" .. slot, server = server:gsub("/$", "") }
-  writeFile(CFG_FILE, textutils.serialize(cfg))
+-- A first start: I'm on my depot spot facing north (the server says where that is).
+local function startFresh(askFirst)
   os.setComputerLabel(cfg.label)
-  local reply = get(string.format("/hello?t=%s&n=%d", cfg.label, slot))
+  local reply = get(string.format("/hello?t=%s&n=%d", cfg.label, cfg.slot))
   local hx, hy, hz = (reply or ""):match("^home (%-?%d+) (%-?%d+) (%-?%d+)")
-  if not hx then print("Can't reach the job server at " .. cfg.server); return end
+  if not hx then print("Can't reach the job server at " .. cfg.server); return false end
   print(string.format("I'm %s. My depot spot is %s,%s,%s.", cfg.label, hx, hy, hz))
   print("I must be standing on it, facing NORTH, with my Ender Chest in slot 16.")
-  if args[#args] ~= "go" then print("Enter to start, Ctrl+T to cancel."); read() end
-  if turtle.getItemCount(CHEST) == 0 then print("No Ender Chest in slot 16."); return end
+  if askFirst then print("Enter to start, Ctrl+T to cancel."); read() end
+  if turtle.getItemCount(CHEST) == 0 then print("No Ender Chest in slot 16."); return false end
   local cs = self_.getStackInSlot(CHEST)
   st = { phase = "check", check = {}, pos ={ x = tonumber(hx), y = tonumber(hy), z = tonumber(hz), f = 3 },
     home = { x = tonumber(hx), y = tonumber(hy), z = tonumber(hz) }, chest = cs and { id = cs.id, dmg = cs.dmg },
@@ -898,8 +920,36 @@ if args[1] then
   pos = st.pos
   if fs.exists(PLAN_FILE) then fs.delete(PLAN_FILE) end
   save()
+  return true
+end
+
+if args[1] then
+  local slot = tonumber(args[1])
+  if not slot or slot < 1 or slot > 64 then print("Usage: cityfleet <slot> [server] [go]"); return end
+  local server = (args[2] and args[2] ~= "go") and args[2] or DEFAULT_SERVER
+  cfg = { slot = slot, label = "city" .. slot, server = server:gsub("/$", "") }
+  writeFile(CFG_FILE, textutils.serialize(cfg))
+  if not startFresh(args[#args] ~= "go") then return end
 elseif not cfg or not loadState() then
   say("Usage: cityfleet <slot> [server] [go] | cityfleet status"); return
+else
+  -- Restart turtles: someone put me back on my depot spot and turned me on (or I was home)
+  local b = get("/boot?t=" .. cfg.label)
+  local home = pos.x == st.home.x and pos.y == st.home.y and pos.z == st.home.z
+  if b and b:match("^fresh") and (st.off or home) then
+    if turtle.getItemCount(CHEST) == 0 then
+      for _, side in ipairs({ "top", "front" }) do
+        local p = peripheral.wrap(side)
+        if p and p.getAllStacks then chestAt = side; pickUpChest(); break end
+      end
+    end
+    if not turtle.detectDown() then
+      say("The job server says start over, but there's nothing under me, so I'm not on my depot spot. Put me on it facing north and turn me off and on.")
+      return
+    end
+    say("The job server says start over: starting fresh from my depot spot.")
+    if not startFresh(false) then return end
+  end
 end
 say(string.format("cityfleet %s starting: %s at %d,%d,%d, fuel %s", VERSION, st.phase, pos.x, pos.y, pos.z, tostring(turtle.getFuelLevel())))
 
