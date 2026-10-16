@@ -44,6 +44,8 @@ the build places; columns taller than the lowest lane (downtown's towers) are fl
 straight runs: an L if one is clear, else a search that avoids turns.
 Depot: DEPOT_ROW slots per row (0 = one row), rows DEPOT_ROWSTEP blocks apart in z.
 
+When the open zones are done (and a zone is still closed), every turtle flies home and waits there:
+the depot stays loaded, so the done zone's chunk loaders can be moved to the next zone before it opens.
 Position check (for a repair of a pasted city, where a turtle that is a block off would dig the paste):
 env CHECK='{"y": 63, "rows": [[x0, x1, lastZ], ...]}' = the ground layer's y and, for x0..x1, the last z
 the paste reaches. On a first start a turtle flies north from its depot spot at home height, digging
@@ -420,7 +422,7 @@ class City:
             jid = self.pick(label, sx, sz, dist)
             if not jid:
                 left = [k for k in self.order if k not in self.done and self.jobs[k]["kind"] != "water"]
-                hint = ""
+                hint, zoneWait = "", None
                 if self.zones:
                     closed = [k for k in left if not self.zone_ok(self.jobs[k])]
                     left = [k for k in left if self.zone_ok(self.jobs[k])]
@@ -428,7 +430,9 @@ class City:
                         nxt = next(z for z in self.zones if z not in self.zonesOpen and any(self.jobs[k]["zone"] == z for k in closed))
                         hint = "; open the next zone (%s) once its chunks are loaded" % self.zoneNames.get(nxt, nxt)
                         if not left:
-                            return "wait 60 the open zones are done" + hint
+                            # the open zones are done: everybody goes home (the depot stays loaded) and waits
+                            # there, so the done zone's chunk loaders can be moved to the next one
+                            zoneWait = "wait 60 the open zones are done and I'm home" + hint
                 if left:
                     busy = sum(1 for k in left if k in {c["job"] for c in self.claims.values()})
                     res = self.reserved()
@@ -439,10 +443,10 @@ class City:
                     return "wait 30 %d jobs left, %d being built, the rest wait for them%s" % (len(left), busy, hint)
                 home = self.homes.get(label)
                 if not home:
-                    return "none"
+                    return zoneWait or "none"
                 hx, hz = self.local(home[0], home[2])
                 if (sx, sz) == (hx, hz):
-                    return "none"
+                    return zoneWait or "none"
                 r = route_to((hx, hz))
                 if r is None:
                     return "wait 60 no way home from here"

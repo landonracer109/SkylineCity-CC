@@ -199,6 +199,8 @@ local function stackTable(st, names) return st and { id = st.id, dmg = st.dmg, q
 local function makeTurtle(n)
   local o = OFFSET[n] or { 0, 0, 0 }
   local row, col = 0, n - 1
+-- CHUNKLOG=<file>: every chunk a turtle moved into, written at the end ("cx cz" lines)
+CHUNKS = os.getenv("CHUNKLOG") and {} or nil
   if DEPOT_ROW > 0 then row, col = math.floor((n - 1) / DEPOT_ROW), (n - 1) % DEPOT_ROW end
   local T = { n = n, x = DEPOT_X0 + DEPOT_STEP * col + o[1], y = GROUND + o[2], z = DEPOT_Z + DEPOT_ROWSTEP * row + o[3], f = 3, digs = 0, fuel = 2500, sel = 1, inv = {},
     clock = 0, boot = 0, chest = {}, dir = DIR .. "/t" .. n, files = {}, log = {}, restartIdx = 0, finished = false, planMats = {}, planStamp = "" }
@@ -298,6 +300,7 @@ local function envFor(T)
   end
   local function simple(dt) if restartDue(T) then coroutine.yield("KILL") end; act(T, dt) end
   local function detect(dir) simple(.05); local x, y, z = target(dir); return at(x, y, z) ~= nil or turtleAt[key(x, y, z)] ~= nil end
+    if CHUNKS then CHUNKS[(zoneAll and zoneAll[zoneN] or "all") .. " " .. math.floor(x / 16) .. " " .. math.floor(z / 16)] = true end
   local function dig(dir)
     simple(.4)
     local x, y, z = target(dir)
@@ -506,7 +509,7 @@ local function envFor(T)
     T.log[#T.log + 1] = string.format("%8.0fs  %s", T.clock, s)
     if s:find("Nothing left to build") then T.finished = true end
     if s:find("Paused") then T.saidPaused = true end
-    if s:find("open the next zone", 1, true) and not zoneAsk then zoneAsk = T.clock end
+    if s:find(ZONES_STRICT and "the open zones are done" or "open the next zone", 1, true) and not zoneAsk then zoneAsk = T.clock end
     local bx, by, bz = s:match("in my way at (%-?%d+),(%-?%d+),(%-?%d+)")
     if bx and not T.toldBlock then
       T.toldBlock = true
@@ -613,6 +616,9 @@ while true do
   local T
   for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end
   if placeAt and (not T or T.clock >= placeAt) then placeTurtles(); T = nil; for _, t in ipairs(turtles) do if t.co and (not T or t.clock < T.clock) then T = t end end end
+-- ZONES_STRICT=1: the next zone is opened only once a turtle is told the open zones are done (like
+-- the player, who moves the chunk loaders when every turtle is home)
+ZONES_STRICT = os.getenv("ZONES_STRICT") == "1"
   if not T then ended = "every turtle stopped"; break end
   if RESTART and T.clock >= RESTART then
     pressRestart(T.clock); RESTART = nil
@@ -653,7 +659,9 @@ while true do
     local open = {}
     for i = 1, zoneN do open[#open + 1] = zoneAll[i] end
     assert(postBody("/zones", table.concat(open, " "), true):match("^open"), "zones refused")
-    zoneLog[#zoneLog + 1] = string.format("%s opened at %.2f h (asked %.2f h, %d placed)", zoneAll[zoneN], clock / 3600, zoneAsk / 3600, stats.places)
+    local away = 0
+    for _, t in ipairs(turtles) do if t.x ~= t.start[1] or t.z ~= t.start[3] then away = away + 1 end end
+    zoneLog[#zoneLog + 1] = string.format("%s opened at %.2f h (asked %.2f h, %d placed, %d turtles away from home)", zoneAll[zoneN], clock / 3600, zoneAsk / 3600, stats.places, away)
     io.stderr:write(zoneLog[#zoneLog] .. "\n")
     zoneAsk = nil
     for _, t in ipairs(turtles) do t.zoneHint = nil end
@@ -764,3 +772,4 @@ io.write(string.format("Ender Chests of other turtles dug: %d\n", stats.chestsTa
 io.write(string.format("Ender Chests put in front (top of the world): %d   torch placements refused: %d\n", stats.frontChests or 0, stats.torchFails or 0))
 io.write(string.format("moves %d  turns %d  places %d  digs %d  restocks %d  peripheral calls %d  http %d  restarts %d (lost answers %d)  waits for turtles %d  coal blocks burned %d\n",
   stats.moves, stats.turns, stats.places, stats.digs, stats.restocks, stats.perCalls, stats.http, stats.restarts, stats.lostMoves, stats.waitsTurtle, stats.coal))
+if CHUNKS then local f = io.open(os.getenv("CHUNKLOG"), "w"); for k in pairs(CHUNKS) do f:write(k, "\n") end; f:close() end
